@@ -312,6 +312,7 @@ set (wsjtx_CXXSRCS
   WSPR/WsprTxScheduler.cpp
   widgets/mainwindow.cpp
   Configuration.cpp
+  TcpCliServer.cpp
   main.cpp
   Network/wsprnet.cpp
   WSPR/WSPRBandHopping.cpp

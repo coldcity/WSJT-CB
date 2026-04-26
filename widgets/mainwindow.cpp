@@ -88,6 +88,7 @@
 #include "Network/MessageClient.hpp"
 #include "Network/FoxVerifier.hpp"
 #include "Network/wsprnet.h"
+#include "TcpCliServer.hpp"
 #include "signalmeter.h"
 #include "HelpTextWindow.hpp"
 #include "SampleDownloader.hpp"
@@ -2432,6 +2433,8 @@ void MainWindow::dataSink(qint64 frames)
   }
 
   if(bCallDecoder) {
+    // Snapshot savg NOW, before the Detector overwrites it during decoding
+    m_cliSavgSnapshot = QVector<float> (dec_data.savg, dec_data.savg + NSMAX);
     if(m_mode=="Echo") {
       float dBerr=0.0;
       int nfrit=0;
@@ -3844,7 +3847,18 @@ void MainWindow::on_sbTxPercent_valueChanged (int n)
 void MainWindow::auto_tx_mode (bool state)
 {
   ui->autoButton->setChecked (state);
-  on_autoButton_clicked (state);
+  // Enabling TX mid-slot would fire TX immediately on the next guiUpdate
+  // tick regardless of whether that was intended.  Defer activation until
+  // the next slot boundary so every TX attempt starts clean.
+  if (state && m_bTxTime) {
+    int   periodMs = static_cast<int> (m_TRperiod * 1000.0);
+    qint64 msNow   = QDateTime::currentMSecsSinceEpoch () % 86400000;
+    int   msInPer  = static_cast<int> (msNow % periodMs);
+    int   msToNext = periodMs - msInPer + 200; // 200 ms past boundary
+    QTimer::singleShot (msToNext, this, [this]() { on_autoButton_clicked (true); });
+  } else {
+    on_autoButton_clicked (state);
+  }
 }
 
 void MainWindow::keyPressEvent (QKeyEvent * e)
@@ -5747,12 +5761,23 @@ void MainWindow::decodeDone ()
     ARRL_Digi_Display();  // Update the ARRL_DIGI display
   }
 
-  if(m_mode!="FT8" or dec_data.params.nzhsym==50 or (m_mode=="FT8" and m_multithreadFT8 and (m_hsymStop==dec_data.params.nzhsym))) m_nDecodes=0; //ft8md
+  bool const finalDecodPass = (m_mode!="FT8" or dec_data.params.nzhsym==50 or
+                               (m_mode=="FT8" and m_multithreadFT8 and (m_hsymStop==dec_data.params.nzhsym)));
+  if(finalDecodPass) m_nDecodes=0; //ft8md
 
   if(m_mode=="Q65" and (m_specOp==SpecOp::NA_VHF or m_specOp==SpecOp::ARRL_DIGI
                         or m_specOp==SpecOp::WW_DIGI or m_specOp==SpecOp::Q65_PILEUP)
                         and m_ActiveStationsWidget!=NULL) {
     refreshPileupList();
+  }
+
+  // Emit spectrum + decode burst for TcpCliServer only once per TR period,
+  // at the final decode pass (all passes have accumulated into m_cliDecodeAccumulator).
+  if(finalDecodPass)
+  {
+    emit spectrumReady (m_cliSavgSnapshot, m_df3, dec_data.params.nfa, dec_data.params.nfb);
+    emit decodesReady  (m_cliDecodeAccumulator);
+    m_cliDecodeAccumulator.clear ();
   }
 }
 
@@ -7275,6 +7300,8 @@ void MainWindow::readFromStdout()                             //readFromStdout
 
       if (!blockUDP)    // block udp spotting for false decodes (JTAlert)
       postDecode (true, decodedtext.string ());
+      else
+      m_cliDecodeAccumulator.append (decodedtext.string ().trimmed ()); // CLI sees all decodes
 
       if(m_mode=="FT8" and SpecOp::HOUND==m_specOp) {
         if(decodedtext.string().contains(";")) {
@@ -8130,6 +8157,7 @@ void MainWindow::guiUpdate()
       default: break;             // determined elsewhere
     }
     m_transmitting = true;
+    emit txStarted (m_currentMessage.trimmed ());
     transmitDisplay (true);
     statusUpdate ();
   }
@@ -8467,6 +8495,7 @@ void MainWindow::stopTx()
   m_btxok = false;
   m_transmitting = false;
   g_iptt=0;
+  emit txStopped ();
   if (!m_tx_watchdog) {
     tx_status_label.setStyleSheet("");
     tx_status_label.setText("");
@@ -13301,6 +13330,9 @@ void MainWindow::replayDecodes ()
 
 void MainWindow::postDecode (bool is_new, QString const& message)
 {
+  // Always accumulate for the TCP CLI, regardless of UDP filtering
+  m_cliDecodeAccumulator.append (message.trimmed ());
+
   if (no_decodes_to_UDP) return;  // Don't send decoded messages to messageClient after a band change
   if (filtered) return;           // Don't send filtered messages to messageClient
   if (message.contains("$VERIFY$")) return;   // Don't send SuperFox OTP messages to messageClient
@@ -13329,6 +13361,66 @@ void MainWindow::postWSPRDecode (bool is_new, QStringList parts)
                                 , parts[2].toFloat (), Radio::frequency (parts[3].toFloat (), 6)
                                 , parts[4].toInt (), parts[5], parts[6], parts[7].toInt ()
                                 , m_diskData);
+}
+
+void MainWindow::connectCli (TcpCliServer* cli)
+{
+  if (!cli) return;
+
+  // Push spectrum + decodes to the CLI after each decode cycle
+  connect (this, &MainWindow::spectrumReady, cli, &TcpCliServer::onSpectrum);
+  connect (this, &MainWindow::decodesReady,  cli, &TcpCliServer::onDecodes);
+
+  // TX state notifications
+  connect (this, &MainWindow::txStarted, cli, &TcpCliServer::onTxStart);
+  connect (this, &MainWindow::txStopped, cli, &TcpCliServer::onTxStop);
+
+  // Keep CLI informed of TX-first (Odd/Even slot) state
+  connect (ui->txFirstCheckBox, &QCheckBox::toggled, cli, &TcpCliServer::onTxFirstChanged);
+  cli->onTxFirstChanged (m_txFirst);  // seed initial state
+
+  // CLI "answer" command → reply to a CQ (same pathway as UDP MessageClient::reply)
+  connect (cli, &TcpCliServer::replySignal, this, &MainWindow::replyToCQ);
+
+  // CLI "cq" command → set TX audio offset, then press the CQ TX button.
+  // auto_tx_mode handles slot-boundary deferral for both CLI and UI.
+  connect (cli, &TcpCliServer::setTxAudioFreqSignal, this, [this](int hz) {
+    ui->TxFreqSpinBox->setValue (hz);
+  });
+  connect (cli, &TcpCliServer::startCQSignal, this, [this]() {
+    on_txb6_clicked ();
+    if (!m_auto) auto_tx_mode (true);
+  });
+
+  // CLI "set halt on|off" → enable/disable TX (autoButton)
+  connect (cli, &TcpCliServer::setAutoSignal, this, [this](bool enable) {
+    if (ui->autoButton->isChecked () != enable)
+      ui->autoButton->click ();
+  });
+
+  // CLI "select" / "set rxfreq" → RX audio offset
+  connect (cli, &TcpCliServer::setRxAudioFreqSignal, this, [this](int hz) {
+    ui->RxFreqSpinBox->setValue (hz);
+  });
+
+  // CLI "set txfirst on|off" → odd time slot checkbox
+  connect (cli, &TcpCliServer::setTxFirstSignal, this, [this](bool txFirst) {
+    m_txFirst = txFirst;
+    ui->txFirstCheckBox->setChecked (txFirst);
+  });
+
+  // CLI "set callsign" → update config + refresh TX messages
+  connect (cli, &TcpCliServer::setCallsignSignal, this, [this](QString const& call) {
+    m_config.set_my_callsign (call);
+    m_baseCall = Radio::base_callsign (call);
+    genStdMsgs (m_rpt, true);
+  });
+
+  // CLI "set grid" / "set location" → update config + refresh TX messages
+  connect (cli, &TcpCliServer::setGridSignal, this, [this](QString const& grid) {
+    m_config.set_my_grid (grid);
+    genStdMsgs (m_rpt, true);
+  });
 }
 
 void MainWindow::networkError (QString const& e)

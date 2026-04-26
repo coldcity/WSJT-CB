@@ -101,6 +101,8 @@ public:
 
   QString my_callsign () const;
   QString my_grid () const;
+  void set_my_callsign (QString const&);
+  void set_my_grid (QString const&);
   QString Field_Day_Exchange() const;
   QString RTTY_Exchange() const;
   QString Contest_Name() const;

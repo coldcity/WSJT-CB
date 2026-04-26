@@ -124,6 +124,17 @@ public:
 
   int decoderBusy () const {return m_decoderBusy;}
 
+  // Wire a TcpCliServer instance to this window.
+  // Called from main() after both objects are constructed.
+  void connectCli (class TcpCliServer* cli);
+
+  // Signals emitted at the end of each decode cycle (when decoder finishes).
+  // Connected to TcpCliServer by connectCli().
+  Q_SIGNAL void spectrumReady (QVector<float> savg, float df3, int nfa, int nfb);
+  Q_SIGNAL void decodesReady  (QStringList decodes);
+  Q_SIGNAL void txStarted (QString message);
+  Q_SIGNAL void txStopped ();
+
 public slots:
   void showSoundInError(const QString& errorMsg);
   void showSoundOutError(const QString& errorMsg);
@@ -827,6 +838,8 @@ private:
   QString m_dateTime;
   QString m_mode;
   QString m_modeTx;//ft8md
+  QStringList m_cliDecodeAccumulator; // accumulates decode lines for TcpCliServer
+  QVector<float> m_cliSavgSnapshot;    // spectrum snapshot taken at decode-period start
   QString m_fnameWE;            // save path without extension
   QString m_rpt;
   QString m_nextRpt;

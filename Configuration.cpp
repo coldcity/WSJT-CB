@@ -1008,6 +1008,18 @@ bool Configuration::restart_audio_output () const {return m_->restart_sound_outp
 bool Configuration::restart_tci () const {return m_->restart_tci_device_;}
 auto Configuration::type_2_msg_gen () const -> Type2MsgGen {return m_->type_2_msg_gen_;}
 QString Configuration::my_callsign () const {return m_->my_callsign_;}
+
+void Configuration::set_my_callsign (QString const& call)
+{
+  m_->my_callsign_ = call;
+  m_->settings_->setValue ("MyCall", call);
+}
+
+void Configuration::set_my_grid (QString const& grid)
+{
+  m_->my_grid_ = grid;
+  m_->settings_->setValue ("MyGrid", grid);
+}
 QFont Configuration::text_font () const {return m_->font_;}
 QFont Configuration::decoded_text_font () const {return m_->decoded_text_font_;}
 qint32 Configuration::id_interval () const {return m_->id_interval_;}

@@ -46,6 +46,7 @@
 #include "WSJTXLogging.hpp"
 #include "MultiSettings.hpp"
 #include "widgets/mainwindow.h"
+#include "TcpCliServer.hpp"
 #include "commons.h"
 #include "lib/init_random_seed.h"
 #include "Radio.hpp"
@@ -168,6 +169,23 @@ int main(int argc, char *argv[])
       QCommandLineOption test_option (QStringList {} << "test-mode"
                                       , "Writable files in test location.  Use with caution, for testing only.");
       parser.addOption (test_option);
+
+      // TCP CLI server options
+      QCommandLineOption cli_port_option (QStringList {} << "cli-port"
+                                          , "Enable TCP CLI server on <port> (loopback only)."
+                                          , "port");
+      parser.addOption (cli_port_option);
+
+      QCommandLineOption cli_pass_option (QStringList {} << "cli-pass"
+                                          , "Require <password> to authenticate on the CLI port."
+                                          , "password");
+      parser.addOption (cli_pass_option);
+
+      QCommandLineOption cli_bind_option (QStringList {} << "cli-bind"
+                                          , "Bind CLI server to <address> (default: 0.0.0.0)."
+                                          , "address"
+                                          , "0.0.0.0");
+      parser.addOption (cli_bind_option);
 
       if (!parser.parse (a.arguments ()))
         {
@@ -441,6 +459,36 @@ int main(int argc, char *argv[])
           w.show();
           splash.raise ();
           QObject::connect (&a, SIGNAL (lastWindowClosed()), &a, SLOT (quit()));
+
+          // Optional TCP CLI server
+          QScopedPointer<TcpCliServer> cli_server;
+          if (parser.isSet (cli_port_option))
+            {
+              bool port_ok;
+              int port_val = parser.value (cli_port_option).toInt (&port_ok);
+              if (!port_ok || port_val < 1 || port_val > 65535)
+                {
+                  MessageBox::warning_message (nullptr, "CLI port error",
+                                              "--cli-port must be a number between 1 and 65535");
+                }
+              else
+                {
+                  QString cli_pass = parser.isSet (cli_pass_option)
+                                     ? parser.value (cli_pass_option)
+                                     : QString {};
+                  QHostAddress bind_addr;
+                  if (!bind_addr.setAddress (parser.value (cli_bind_option)))
+                    {
+                      MessageBox::warning_message (nullptr, "CLI bind error",
+                                                  "--cli-bind value is not a valid IP address; defaulting to 0.0.0.0");
+                      bind_addr = QHostAddress::AnyIPv4;
+                    }
+                  cli_server.reset (new TcpCliServer (
+                                        static_cast<quint16> (port_val), cli_pass, bind_addr));
+                  w.connectCli (cli_server.data ());
+                }
+            }
+
           result = a.exec();
 
           // ensure config switches start with the right style sheet
