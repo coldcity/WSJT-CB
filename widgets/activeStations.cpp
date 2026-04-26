@@ -92,7 +92,7 @@ void ActiveStations::setupUi(QString mode) {
       ui->header_label2->setText("  N   Freq  Call    Grid   El   Age(h)");
       ui->cbWantedOnly->setText(QCoreApplication::translate("ActiveStations", "Wanted only", nullptr));
     } else if(m_mode=="Fox Mode" || m_mode=="SuperFox Mode" ) {
-      ui->header_label2->setText("  UTC   dB   DT Freq    " + tr("Message"));
+      ui->header_label2->setText("  UTC   dB   DT Freq    " + tr("Country").leftJustified(12) + tr("Message"));
       ui->cbWantedOnly->setText(QCoreApplication::translate("ActiveStations", "My call only", nullptr));
       this->setClickOK(true);
     } else {

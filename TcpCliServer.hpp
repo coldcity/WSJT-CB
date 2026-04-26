@@ -15,11 +15,12 @@
 //
 // Start-up: pass --cli-port <N> to enable; optional --cli-pass <password>
 // and --cli-bind <address> (default 0.0.0.0).
-// requires the client to authenticate before issuing commands.
+// If --cli-pass is set, the client must send that password as the first line;
+// no banner or prompt is sent until it matches. Otherwise the connection is Idle immediately.
 //
 // States:
-//   Unauthed  — connection just opened, awaiting "auth <password>" if required
-//   Idle      — authenticated, accepts set/status/run/… commands
+//   Unauthed  — --cli-pass set; only "? " has been sent; awaiting first line (password) before banner
+//   Idle      — ready for commands (no password, or password line matched)
 //   Running   — streaming mode: pushes one spectrum + decode burst per TR period
 //
 // TX signals are wired externally (in MainWindow::connectCli) to MainWindow's
@@ -42,7 +43,8 @@ public:
     // Inbound data from MainWindow
     // -----------------------------------------------------------------------
     Q_SLOT void onSpectrum(QVector<float> savg, float df3, int nfa, int nfb);
-    Q_SLOT void onDecodes(QStringList decodes);
+    // countries[i] is display name for decodes[i] (DXCC entity from DE call); may be shorter than decodes.
+    Q_SLOT void onDecodes(QStringList decodes, QStringList countries);
     Q_SLOT void onTxStart(QString message);
     Q_SLOT void onTxStop();
     Q_SLOT void onTxFirstChanged(bool txFirst);
@@ -70,11 +72,19 @@ public:
     // Fires for "stoptx" — same as main-window Stop Tx (halt RF + end AutoSeq until next cq/answer)
     Q_SIGNAL void stopTxSignal();
 
+    // Fires when the TCP client disconnects (used to halt TX if a sequence was started via CLI)
+    Q_SIGNAL void clientDisconnected();
+
     // Fires for "set rxfreq <Hz>" / select
     Q_SIGNAL void setRxAudioFreqSignal(int hz);
 
     // Fires for "set txfirst on|off"
     Q_SIGNAL void setTxFirstSignal(bool txFirst);
+
+    // Emitted for each line written to the CLI transcript (same text as the log file line, without trailing newline).
+    Q_SIGNAL void cliLogLineAppended(QString const& line);
+
+    QString cliLogFilePath() const { return m_cliLogPath; }
 
 private Q_SLOTS:
     void onNewConnection();
@@ -95,13 +105,17 @@ private:
     // CR+LF so async lines appear below the `> ` prompt (terminal has no echo newline)
     void sendLineAfterNewline(QString const& text);
     void sendPrompt();
+    void sendWelcomeBanner();
+    void tryFirstLinePassword(QString const& line);
     void printHelp();
     void printStatus();
     void printSelectedSlot();
 
-    // Spectrum rendering
-    QString renderSpectrum(QVector<float> const& savg, float df3, int nfa, int nfb, int selectedHz, bool txFirst) const;
+    // Spectrum: bar + optional marker (two client lines, two log lines — no embedded CR/LF)
+    void renderSpectrumLines(QVector<float> const& savg, float df3, int nfa, int nfb, int selectedHz, bool txFirst,
+                             QString& barLine, QString& markerLine) const;
 
+    void appendSingleCliLogLine(QString const& role, QString const& text);
     void appendCliLog(QString const& role, QString const& text);
 
     QTcpServer    m_server;
@@ -111,13 +125,15 @@ private:
     QString       m_password;           // empty → no auth required
     QString       m_readBuf;            // line accumulation buffer
 
-    static constexpr int m_spectrumWidth = 96;
+    static constexpr int m_spectrumWidth = 48;
     QStringList   m_lastDecodes;        // last full decode batch
+    QStringList   m_lastDecodeCountries; // parallel: DXCC-style country name for CLI (same order as m_lastDecodes)
 
     // Selection is keyed by audio frequency (Hz), not by decode-list index.
     // m_selectedDecode empty → freq set but no decode there (valid for cq)
     int           m_selectedFreq   {1200};
     QString       m_selectedDecode;     // raw decode string at m_selectedFreq, or ""
+    QString       m_selectedCountry;    // country column for m_selectedDecode (CLI display)
 
     // Last spectrum snapshot (stored so we can send with decode burst)
     QVector<float> m_pendingSpectrum;
@@ -133,7 +149,8 @@ private:
 
     QString        m_lastTxMessage;   // last message passed to onTxStart (for TX STOP line)
 
-    QFile          m_cliLog;          // append-only transcript: exe dir / wsjtcb-cli.log
+    QString        m_cliLogPath;     // same path as m_cliLog.fileName() after open
+    QFile          m_cliLog;         // append-only transcript: exe dir / wsjtcb-cli.log
 };
 
 #endif // TCP_CLI_SERVER_HPP

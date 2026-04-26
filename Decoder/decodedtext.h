@@ -63,6 +63,9 @@ public:
 
   unsigned timeInSeconds() const;
 
+  // Byte length of the fixed field prefix (time … mode) before the QSO text; 22 or 24 with hhmmss time
+  int prefixFieldLength() const;
+
   // returns a string of the SNR field with a leading + or - followed by two digits
   QString report() const;
 

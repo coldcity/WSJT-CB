@@ -230,6 +230,11 @@ unsigned DecodedText::timeInSeconds() const
     + (padding_ ? string_.mid (column_time + 2 + padding_, 2).toUInt () : 0U);
 }
 
+int DecodedText::prefixFieldLength() const
+{
+  return column_qsoText + padding_;
+}
+
 QString DecodedText::report() const // returns a string of the SNR field with a leading + or - followed by two digits
 {
     int sr = snr();

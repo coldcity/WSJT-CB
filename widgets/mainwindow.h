@@ -131,7 +131,7 @@ public:
   // Signals emitted at the end of each decode cycle (when decoder finishes).
   // Connected to TcpCliServer by connectCli().
   Q_SIGNAL void spectrumReady (QVector<float> savg, float df3, int nfa, int nfb);
-  Q_SIGNAL void decodesReady  (QStringList decodes);
+  Q_SIGNAL void decodesReady  (QStringList decodes, QStringList countries);
   Q_SIGNAL void txStarted (QString message);
   Q_SIGNAL void txStopped ();
 
@@ -163,6 +163,10 @@ private:
   void childEvent(QChildEvent *) override;
   bool eventFilter(QObject *, QEvent *) override;
   void showQSYMessage(QString message);
+  void updateCliLogDialogStyle ();
+  void loadCliLogFromFile ();
+  void accumulateCliDecode (QString const& message);
+  QString cliCountryForMessage (QString const& message) const;
 
 private slots:
   void initialize_fonts ();
@@ -243,6 +247,8 @@ private slots:
   void on_actionOnline_User_Guide_triggered();
   void on_actionLocal_User_Guide_triggered();
   void on_actionWide_Waterfall_triggered();
+  void on_actionCLI_Log_triggered();
+  void onCliLogLineAppended (QString const& line);
   void on_actionOpen_triggered();
   void on_actionOpen_next_in_directory_triggered();
   void on_actionDecode_remaining_files_in_directory_triggered();
@@ -838,8 +844,12 @@ private:
   QString m_dateTime;
   QString m_mode;
   QString m_modeTx;//ft8md
-  QStringList m_cliDecodeAccumulator; // accumulates decode lines for TcpCliServer
+  QStringList m_cliDecodeAccumulator;  // accumulates decode lines for TcpCliServer
+  QStringList m_cliCountryAccumulator; // parallel: country/entity name for each CLI decode line
   QVector<float> m_cliSavgSnapshot;    // spectrum snapshot taken at decode-period start
+  class TcpCliServer* m_cliServer {nullptr};
+  class QDialog*     m_cliLogDialog {nullptr};
+  class QPlainTextEdit* m_cliLogEdit {nullptr};
   QString m_fnameWE;            // save path without extension
   QString m_rpt;
   QString m_nextRpt;

@@ -23,6 +23,18 @@
 #include <QProcessEnvironment>
 #include <QSharedMemory>
 #include <QFileDialog>
+#include <QFile>
+#include <QDialog>
+#include <QVBoxLayout>
+#include <QPlainTextEdit>
+#include <QPushButton>
+#include <QFontDatabase>
+#include <QTextCursor>
+#include <QIODevice>
+#include <QPalette>
+#include <QColor>
+#include <QFont>
+#include <QScrollBar>
 #include <QTextBlock>
 #include <QProgressBar>
 #include <QLineEdit>
@@ -2197,6 +2209,7 @@ void MainWindow::apply_main_window_chrome ()
       "#decodes_splitter::handle { background-color: #d3dde7; width: 2px; }"
     });
   }
+  updateCliLogDialogStyle ();
 }
 
 void MainWindow::setDecodedTextFont (QFont const& font)
@@ -4699,6 +4712,111 @@ void MainWindow::on_actionWide_Waterfall_triggered()      //Display Waterfalls
   m_wideGraph->showNormal();
 }
 
+void MainWindow::updateCliLogDialogStyle ()
+{
+  if (!m_cliLogEdit) return;
+  if (m_cliLogEdit->objectName ().isEmpty ())
+    m_cliLogEdit->setObjectName (QStringLiteral ("cliSessionLogView"));
+  // Use the same toggle as "Use dark style" — not palette lightness (unreliable) and not
+  // m_useDarkStyle alone (qApp/qdarkstyle can be out of sync with the action).
+  bool const is_dark = ui->actionUse_Dark_Style->isChecked ();
+  QFont f;
+#if defined (_WIN32)
+  f = QFont (QStringLiteral ("Consolas"));
+#else
+  f = QFontDatabase::systemFont (QFontDatabase::FixedFont);
+  f.setStyleHint (QFont::Monospace, QFont::PreferDefault);
+  f.setFixedPitch (true);
+#endif
+  if (is_dark) {
+    // qdarkstyle applies QPlainTextEdit { ... } on the app; per-widget QSS wins over QPalette.
+    constexpr int kDarkCliLogPt = 26;
+    f.setPointSize (kDarkCliLogPt);
+    m_cliLogEdit->setFont (f);
+    m_cliLogEdit->setStyleSheet (QStringLiteral (
+        "QPlainTextEdit#cliSessionLogView {"
+        "  background-color: #000000;"
+        "  color: #33ff99;"
+        "  selection-background-color: #004d33;"
+        "  selection-color: #eeffee;"
+        "  border: 1px solid #3d4d4d;"
+        "}"));
+    if (m_cliLogDialog) {
+      m_cliLogDialog->setStyleSheet (QStringLiteral (
+          "QDialog { background-color: #000000; }"
+          "QPushButton { background-color: #2a2a2a; color: #99ffcc; min-width: 7em; padding: 6px; }"));
+    }
+  } else {
+    qreal const base = m_config.text_font ().pointSizeF ();
+    if (base > 0.0) f.setPointSizeF (std::max (16.0, base + 4.0));
+    else f.setPointSize (18);
+    m_cliLogEdit->setFont (f);
+    m_cliLogEdit->setStyleSheet (QStringLiteral (
+        "QPlainTextEdit#cliSessionLogView {"
+        "  background-color: #ffffff;"
+        "  color: #000000;"
+        "  selection-background-color: #2f80c1;"
+        "  selection-color: #ffffff;"
+        "  border: 1px solid #b0b0b0;"
+        "}"));
+    if (m_cliLogDialog) m_cliLogDialog->setStyleSheet (QString {});
+  }
+}
+
+void MainWindow::loadCliLogFromFile ()
+{
+  if (!m_cliLogEdit || !m_cliServer) return;
+  QFile f (m_cliServer->cliLogFilePath ());
+  if (f.open (QIODevice::ReadOnly))
+    m_cliLogEdit->setPlainText (QString::fromUtf8 (f.readAll ()));
+  else
+    m_cliLogEdit->clear ();
+  QTextCursor tc = m_cliLogEdit->textCursor ();
+  tc.movePosition (QTextCursor::End);
+  m_cliLogEdit->setTextCursor (tc);
+  m_cliLogEdit->ensureCursorVisible ();
+  if (QScrollBar* sb = m_cliLogEdit->verticalScrollBar ())
+    sb->setValue (sb->maximum ());
+}
+
+void MainWindow::onCliLogLineAppended (QString const& line)
+{
+  if (!m_cliLogEdit) return;
+  QTextCursor c = m_cliLogEdit->textCursor ();
+  c.movePosition (QTextCursor::End);
+  c.insertText (line + QLatin1Char ('\n'));
+  m_cliLogEdit->setTextCursor (c);
+  m_cliLogEdit->ensureCursorVisible ();
+}
+
+void MainWindow::on_actionCLI_Log_triggered ()
+{
+  if (!m_cliServer) return;
+  if (!m_cliLogDialog)
+    {
+      m_cliLogDialog = new QDialog (this);
+      m_cliLogDialog->setWindowTitle (tr ("CLI session log"));
+      auto* vbox = new QVBoxLayout (m_cliLogDialog);
+      m_cliLogEdit = new QPlainTextEdit (m_cliLogDialog);
+      m_cliLogEdit->setReadOnly (true);
+      m_cliLogEdit->setLineWrapMode (QPlainTextEdit::NoWrap);
+      updateCliLogDialogStyle ();
+      vbox->addWidget (m_cliLogEdit);
+      auto* closeBtn = new QPushButton (tr ("Close"));
+      connect (closeBtn, &QPushButton::clicked, m_cliLogDialog, &QWidget::close);
+      vbox->addWidget (closeBtn);
+      m_cliLogDialog->resize (1080, 640);
+      loadCliLogFromFile ();
+    }
+  else if (!m_cliLogDialog->isVisible ())
+    loadCliLogFromFile ();
+  updateCliLogDialogStyle ();
+  m_cliLogDialog->setWindowTitle (tr ("CLI session log — %1").arg (m_cliServer->cliLogFilePath ()));
+  m_cliLogDialog->show ();
+  m_cliLogDialog->raise ();
+  m_cliLogDialog->activateWindow ();
+}
+
 void MainWindow::on_actionEcho_Graph_triggered()
 {
   m_echoGraph->showNormal();
@@ -5776,8 +5894,9 @@ void MainWindow::decodeDone ()
   if(finalDecodPass)
   {
     emit spectrumReady (m_cliSavgSnapshot, m_df3, dec_data.params.nfa, dec_data.params.nfb);
-    emit decodesReady  (m_cliDecodeAccumulator);
+    emit decodesReady  (m_cliDecodeAccumulator, m_cliCountryAccumulator);
     m_cliDecodeAccumulator.clear ();
+    m_cliCountryAccumulator.clear ();
   }
 }
 
@@ -7301,7 +7420,7 @@ void MainWindow::readFromStdout()                             //readFromStdout
       if (!blockUDP)    // block udp spotting for false decodes (JTAlert)
       postDecode (true, decodedtext.string ());
       else
-      m_cliDecodeAccumulator.append (decodedtext.string ().trimmed ()); // CLI sees all decodes
+      accumulateCliDecode (decodedtext.string ().trimmed ()); // CLI sees all decodes
 
       if(m_mode=="FT8" and SpecOp::HOUND==m_specOp) {
         if(decodedtext.string().contains(";")) {
@@ -13336,7 +13455,7 @@ void MainWindow::replayDecodes ()
 void MainWindow::postDecode (bool is_new, QString const& message)
 {
   // Always accumulate for the TCP CLI, regardless of UDP filtering
-  m_cliDecodeAccumulator.append (message.trimmed ());
+  accumulateCliDecode (message);
 
   if (no_decodes_to_UDP) return;  // Don't send decoded messages to messageClient after a band change
   if (filtered) return;           // Don't send filtered messages to messageClient
@@ -13356,6 +13475,51 @@ void MainWindow::postDecode (bool is_new, QString const& message)
     }
 }
 
+void MainWindow::accumulateCliDecode (QString const& message)
+{
+  m_cliDecodeAccumulator.append (message.trimmed ());
+  m_cliCountryAccumulator.append (cliCountryForMessage (message));
+}
+
+QString MainWindow::cliCountryForMessage (QString const& message) const
+{
+  DecodedText const dt (message);
+  QString deCall, deGrid;
+  dt.deCallAndGrid (deCall, deGrid);
+  if (deCall.isEmpty ())
+    {
+      return QString (QChar (0x2014));
+    }
+  auto const& looked_up = m_logBook.countries ()->lookup (deCall);
+  auto countryName = looked_up.entity_name;
+  if (countryName.isEmpty ())
+    {
+      return QString (QChar (0x2014));
+    }
+  // Same short labels as the main-window territory filter (decode list)
+  countryName.replace (QStringLiteral ("Islands"), QStringLiteral ("Is."));
+  countryName.replace (QStringLiteral ("Island"), QStringLiteral ("Is."));
+  countryName.replace (QStringLiteral ("North "), QStringLiteral ("N. "));
+  countryName.replace (QStringLiteral ("Northern "), QStringLiteral ("N. "));
+  countryName.replace (QStringLiteral ("South "), QStringLiteral ("S. "));
+  countryName.replace (QStringLiteral ("East "), QStringLiteral ("E. "));
+  countryName.replace (QStringLiteral ("Eastern "), QStringLiteral ("E. "));
+  countryName.replace (QStringLiteral ("West "), QStringLiteral ("W. "));
+  countryName.replace (QStringLiteral ("Western "), QStringLiteral ("W. "));
+  countryName.replace (QStringLiteral ("Central "), QStringLiteral ("C. "));
+  countryName.replace (QStringLiteral (" and "), QStringLiteral (" & "));
+  countryName.replace (QStringLiteral ("Republic"), QStringLiteral ("Rep."));
+  countryName.replace (QStringLiteral ("United States Of America"), QStringLiteral ("U.S.A."));
+  countryName.replace (QStringLiteral ("United States of America"), QStringLiteral ("U.S.A."));
+  countryName.replace (QStringLiteral ("United States"), QStringLiteral ("U.S.A."));
+  countryName.replace (QStringLiteral ("Fed. Rep. of "), QStringLiteral (""));
+  countryName.replace (QStringLiteral ("French "), QStringLiteral ("Fr."));
+  countryName.replace (QStringLiteral ("Asiatic"), QStringLiteral ("AS"));
+  countryName.replace (QStringLiteral ("European"), QStringLiteral ("EU"));
+  countryName.replace (QStringLiteral ("African"), QStringLiteral ("AF"));
+  return countryName;
+}
+
 void MainWindow::postWSPRDecode (bool is_new, QStringList parts)
 {
   if (parts.size () < 8)
@@ -13371,6 +13535,7 @@ void MainWindow::postWSPRDecode (bool is_new, QStringList parts)
 void MainWindow::connectCli (TcpCliServer* cli)
 {
   if (!cli) return;
+  m_cliServer = cli;
 
   // Push spectrum + decodes to the CLI after each decode cycle
   connect (this, &MainWindow::spectrumReady, cli, &TcpCliServer::onSpectrum);
@@ -13399,6 +13564,14 @@ void MainWindow::connectCli (TcpCliServer* cli)
 
   // CLI "stoptx" → same as Stop Tx button (end sequence until next cq/answer)
   connect (cli, &TcpCliServer::stopTxSignal, this, &MainWindow::on_stopTxButton_clicked);
+
+  // Halt TX / Auto / mid-QSO AutoSeq when the remote CLI disconnects
+  connect (cli, &TcpCliServer::clientDisconnected, this, [this] () {
+      bool const autoseqOn = ui->cbAutoSeq->isVisible () && ui->cbAutoSeq->isEnabled ()
+          && ui->cbAutoSeq->isChecked () && !m_hisCall.isEmpty ();
+      if (m_transmitting || m_auto || autoseqOn)
+        on_stopTxButton_clicked ();
+    });
 
   // CLI "select" / "set rxfreq" → RX audio offset
   connect (cli, &TcpCliServer::setRxAudioFreqSignal, this, [this](int hz) {
@@ -13431,6 +13604,9 @@ void MainWindow::connectCli (TcpCliServer* cli)
   connect (&m_config, &Configuration::leavingSettings, cli, [cli, this] (bool) {
     cli->setStationSnapshot (m_config.my_callsign (), m_config.my_grid ());
   });
+
+  connect (cli, &TcpCliServer::cliLogLineAppended, this, &MainWindow::onCliLogLineAppended);
+  ui->actionCLI_Log->setEnabled (true);
 }
 
 void MainWindow::networkError (QString const& e)

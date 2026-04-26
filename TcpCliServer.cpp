@@ -5,6 +5,7 @@
 #include <QDateTime>
 #include <QCryptographicHash>
 #include <QIODevice>
+#include <QRegularExpression>
 #include <QVector>
 #include <QtMath>
 #include <algorithm>
@@ -14,17 +15,40 @@
 // CLI transcript log (exe directory, append-only)
 // ---------------------------------------------------------------------------
 
-void TcpCliServer::appendCliLog(QString const& role, QString const& text)
+void TcpCliServer::appendSingleCliLogLine(QString const& role, QString const& text)
 {
-    if (!m_cliLog.isOpen())
+    if (text.isEmpty())
         return;
     QString t = text;
     t.replace(QLatin1Char('\r'), QStringLiteral("\\r"));
     t.replace(QLatin1Char('\n'), QStringLiteral("\\n"));
-    QString const line = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)
-        + QLatin1Char(' ') + role + QLatin1Char(' ') + t + QLatin1Char('\n');
-    m_cliLog.write(line.toUtf8());
-    m_cliLog.flush();
+    QString const displayLine = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)
+        + QLatin1Char(' ') + role + QLatin1Char(' ') + t;
+    if (m_cliLog.isOpen())
+    {
+        m_cliLog.write((displayLine + QLatin1Char('\n')).toUtf8());
+        m_cliLog.flush();
+    }
+    Q_EMIT cliLogLineAppended(displayLine);
+}
+
+void TcpCliServer::appendCliLog(QString const& role, QString const& text)
+{
+    // One timestamp per physical line: split CR/LF so spectrum never logs as literal \r \n
+    if (text.isEmpty())
+        return;
+    if (!text.contains(QLatin1Char('\r')) && !text.contains(QLatin1Char('\n')))
+    {
+        appendSingleCliLogLine(role, text);
+        return;
+    }
+    QRegularExpression const reSplit(QStringLiteral(R"([\r\n]+)"));
+    const QStringList parts = text.split(reSplit, Qt::SkipEmptyParts);
+    for (QString const& part : parts)
+    {
+        if (!part.isEmpty())
+            appendSingleCliLogLine(role, part);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -36,17 +60,17 @@ TcpCliServer::TcpCliServer(quint16 port, QString const& password,
     : QObject(parent)
     , m_password(password)
 {
-    QString const logPath = QCoreApplication::applicationDirPath()
+    m_cliLogPath = QCoreApplication::applicationDirPath()
         + QStringLiteral("/wsjtcb-cli.log");
-    m_cliLog.setFileName(logPath);
+    m_cliLog.setFileName(m_cliLogPath);
     if (!m_cliLog.open(QIODevice::Append))
     {
         qWarning("TcpCliServer: could not open CLI log %s: %s",
-                 qPrintable(logPath), qPrintable(m_cliLog.errorString()));
+                 qPrintable(m_cliLogPath), qPrintable(m_cliLog.errorString()));
     }
     else
     {
-        appendCliLog(QStringLiteral("SYS"), QStringLiteral("log opened ") + logPath);
+        appendCliLog(QStringLiteral("SYS"), QStringLiteral("log opened ") + m_cliLogPath);
     }
 
     connect(&m_server, &QTcpServer::newConnection,
@@ -104,6 +128,7 @@ void TcpCliServer::onNewConnection()
     m_readBuf.clear();
     m_selectedFreq = 1200;
     m_selectedDecode.clear();
+    m_selectedCountry.clear();
 
     connect(m_client, &QTcpSocket::disconnected,
             this,     &TcpCliServer::onClientDisconnected);
@@ -115,14 +140,18 @@ void TcpCliServer::onNewConnection()
                      .arg(m_client->peerAddress().toString())
                      .arg(m_client->peerPort()));
 
-    sendLine("WSJT-CB CLI ready");
     if (m_state == State::Unauthed)
-        sendLine("AUTH required — type: auth <password>");
-    else {
-        sendLine("Happy DX!");
-        sendLine("Type 'help' for commands");
+    {
+        // Coy one-character prompt: password is the first line, no welcome until it matches.
+        appendCliLog(QStringLiteral("OUT"), QStringLiteral("? "));
+        m_client->write("? ");
+        m_client->flush();
     }
-    sendPrompt();
+    else
+    {
+        sendWelcomeBanner();
+        sendPrompt();
+    }
 }
 
 void TcpCliServer::onClientDisconnected()
@@ -138,7 +167,9 @@ void TcpCliServer::onClientDisconnected()
     m_state        = State::Unauthed;
     m_selectedFreq = 1200;
     m_selectedDecode.clear();
+    m_selectedCountry.clear();
     m_readBuf.clear();
+    Q_EMIT clientDisconnected();
 }
 
 // ---------------------------------------------------------------------------
@@ -161,11 +192,16 @@ void TcpCliServer::onReadyRead()
 
         if (!line.isEmpty())
         {
-            QString logLine = line;
-            if (line.startsWith(QStringLiteral("auth "), Qt::CaseInsensitive))
-                logLine = QStringLiteral("auth ***REDACTED***");
-            appendCliLog(QStringLiteral("IN"), logLine);
-            processLine(line);
+            if (m_state == State::Unauthed)
+            {
+                appendCliLog(QStringLiteral("IN"), QStringLiteral("***REDACTED*** (first-line password)"));
+                tryFirstLinePassword(line);
+            }
+            else
+            {
+                appendCliLog(QStringLiteral("IN"), line);
+                processLine(line);
+            }
         }
     }
 }
@@ -176,12 +212,12 @@ void TcpCliServer::onReadyRead()
 
 static constexpr int kCliDecodeIndentCols = 11;
 
-// Raw decode format (space-separated, skip empties):
+// Raw decode format (space-separated, skip empties) — from decoder; display omits p[0] time and p[4] mode (FT8-only CLI):
 //   [0] time (HHMM or HHMMSS)
 //   [1] snr
 //   [2] dt
 //   [3] audio-freq Hz
-//   [4] mode
+//   [4] mode (not shown in CLI text)
 //   [5..] message words
 //
 // Returns the audio frequency field as an integer, or -1 on parse failure.
@@ -194,21 +230,66 @@ static int extractFreqFromDecode(QString const& raw)
     return ok ? f : -1;
 }
 
-// Returns "[FREQ] HHMM snr dt mode message" — freq as bracketed prefix,
-// removed from its original position so it is not shown twice.
-static QString formatDecodeForDisplay(QString const& raw)
+// FT8 on-the-air text is short; keep this small so the country column sits left of big empty gaps.
+static constexpr int kCliMessageCols  = 20; // left-justified; longer text truncated; aligns country
+static constexpr int kCliCountryCols = 16;
+
+static QString formatMessageFieldForCli(QString m)
+{
+    m = m.trimmed();
+    if (m.size() > kCliMessageCols)
+        m = m.left(kCliMessageCols);
+    return m.leftJustified(kCliMessageCols, QLatin1Char(' '));
+}
+
+static QString formatCountryField(QString c)
+{
+    c = c.trimmed();
+    if (c.isEmpty())
+        c = QString(QChar(0x2014)); // em dash — unknown / no DE call
+    if (c.size() > kCliCountryCols)
+        c = c.left(kCliCountryCols);
+    return c.leftJustified(kCliCountryCols, QLatin1Char(' '));
+}
+
+// Returns "  [FFFF]  snr  dt  <padded message>  country" — fixed-width; mode (raw p[4]) omitted (FT8 CLI).
+// Two-char mark before [freq]: "!" + space for CQ, else two spaces, so the "[" column stays bar-aligned.
+// Message is left-justified in kCliMessageCols (truncated if needed) so the country column lines up.
+// Raw line: time snr dt freq mode [words...]; freq is moved to a bracketed prefix, not shown twice.
+static QString formatDecodeForDisplay(QString const& raw, QString const& country)
 {
     QStringList p = raw.trimmed().split(' ', Qt::SkipEmptyParts);
     if (p.size() < 5)
         return raw.trimmed();
 
-    // p[3] is freq — use as prefix, skip in the rejoined string
-    QString freq = p[3];
-    QStringList body;
-    body << p[1] << p[2] << p[4];     // :ss snr dt mode
-    if (p.size() > 5)
-        body << p.mid(5);                     // message words
-    return QString("[%1] %2").arg(freq).arg(body.join("  "));
+    bool okF, okS, okD;
+    int const f  = p[3].toInt(&okF);
+    int const snr = p[1].toInt(&okS);
+    double const dt = p[2].toDouble(&okD);
+
+    QString const freqField = okF
+        ? QStringLiteral("[%1]").arg(QString::number(f).rightJustified(4, QLatin1Char(' ')))
+        : QStringLiteral("[%1]").arg(p[3], 4, QLatin1Char(' '));
+
+    QString const snrField = okS
+        ? QString::number(snr).rightJustified(4, QLatin1Char(' '))
+        : p[1].rightJustified(4, QLatin1Char(' '));
+
+    QString const dtField = okD
+        ? QString::number(dt, 'f', 1).rightJustified(4, QLatin1Char(' '))
+        : p[2].rightJustified(4, QLatin1Char(' '));
+
+    QString const msg = (p.size() > 5) ? p.mid(5).join(QLatin1Char(' ')) : QString();
+    QString const markPrefix = msg.contains(QStringLiteral("CQ"), Qt::CaseInsensitive)
+        ? QStringLiteral("! ")
+        : QStringLiteral("  ");
+    QString const freqWithMark = markPrefix + freqField;
+    QString const msgCol = formatMessageFieldForCli(msg);
+    QString const ccol = formatCountryField(country);
+
+    // Two spaces after dt, fixed-width message, two spaces, fixed-width country
+    return QStringLiteral("%1 %2 %3  %4  %5")
+        .arg(freqWithMark, snrField, dtField, msgCol, ccol);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,11 +313,15 @@ bool TcpCliServer::trySelectAudioFreq(int freqHz)
 
     m_selectedFreq = freqHz;
     m_selectedDecode.clear();
-    for (auto const& raw : m_lastDecodes)
+    m_selectedCountry.clear();
+    for (int i = 0; i < m_lastDecodes.size(); ++i)
     {
+        QString const& raw = m_lastDecodes[i];
         if (extractFreqFromDecode(raw) == freqHz)
         {
             m_selectedDecode = raw;
+            if (i < m_lastDecodeCountries.size())
+                m_selectedCountry = m_lastDecodeCountries[i];
             break;
         }
     }
@@ -249,13 +334,39 @@ bool TcpCliServer::trySelectAudioFreq(int freqHz)
                  .arg(freqHz));
     else
         sendLine(QString("OK: selected %1")
-                 .arg(formatDecodeForDisplay(m_selectedDecode)));
+                 .arg(formatDecodeForDisplay(m_selectedDecode, m_selectedCountry)));
     return true;
 }
 
 // ---------------------------------------------------------------------------
 // Command dispatch
 // ---------------------------------------------------------------------------
+
+// h help · b bye · s status · f select · c cq · a answer · x stoptx
+static void expandOneLetterAuthed(QString& cmd)
+{
+    if (cmd.size() != 1) return;
+    switch (cmd[0].toLower().unicode()) {
+    case u'h': cmd = QStringLiteral("help"); break;
+    case u'b': cmd = QStringLiteral("bye"); break;
+    case u's': cmd = QStringLiteral("status"); break;
+    case u'f': cmd = QStringLiteral("select"); break;
+    case u'a': cmd = QStringLiteral("answer"); break;
+    case u'c': cmd = QStringLiteral("cq"); break;
+    case u'x': cmd = QStringLiteral("stoptx"); break;
+    default:   break;
+    }
+}
+
+static QString cliHelpLine(QString const& commandCol, QString const& oneLetter, QString const& rest)
+{
+    // Fixed-width name column for alignment in monospaced terminals
+    int constexpr kW = 24;
+    return QString("  %1  (%2)  %3")
+        .arg(commandCol.leftJustified(kW, QLatin1Char(' ')))
+        .arg(oneLetter)
+        .arg(rest);
+}
 
 void TcpCliServer::processLine(QString const& line)
 {
@@ -265,48 +376,58 @@ void TcpCliServer::processLine(QString const& line)
     QString cmd = parts[0].toLower();
 
     // -----------------------------------------------------------------------
-    // Auth gate
+    // Commands
     // -----------------------------------------------------------------------
-    if (m_state == State::Unauthed)
+
+    // One-letter set: q=callsign, g=grid, o=odd (before generic expand: q is not “bye”)
+    if (parts[0].size() == 1)
     {
-        if (cmd != "auth")
+        QChar const ch = parts[0][0].toLower();
+        if (ch == u'q')
         {
-            sendLine("ERR: not authenticated — type: auth <password>");
+            if (parts.size() < 2)
+                sendLine("ERR: usage: q <CALL>  (same as: set callsign <CALL>)");
+            else
+            {
+                QStringList p2{QStringLiteral("set"), QStringLiteral("callsign"), parts.mid(1).join(QLatin1Char(' '))};
+                handleSet(p2);
+            }
             sendPrompt();
             return;
         }
-
-        QString supplied = parts.size() > 1 ? parts[1] : QString{};
-
-        // Constant-time compare to resist timing attacks
-        auto h = [](QString const& s) {
-            return QCryptographicHash::hash(s.toUtf8(), QCryptographicHash::Sha256);
-        };
-        bool ok = (h(supplied) == h(m_password));
-
-        if (ok)
+        if (ch == u'g')
         {
-            m_state = State::Idle;
-            sendLine("OK: authenticated");
-            sendLine("Type 'help' for commands");
+            if (parts.size() < 2)
+                sendLine("ERR: usage: g <GRID>  (same as: set grid <GRID>)");
+            else
+            {
+                QStringList p2{QStringLiteral("set"), QStringLiteral("grid"), parts.mid(1).join(QLatin1Char(' '))};
+                handleSet(p2);
+            }
+            sendPrompt();
+            return;
         }
-        else
+        if (ch == u'o')
         {
-            sendLine("ERR: wrong password");
+            if (parts.size() < 2)
+                sendLine("ERR: usage: o <on|off>  (same as: set odd <on|off>)");
+            else
+            {
+                QStringList p2{QStringLiteral("set"), QStringLiteral("odd"), parts.mid(1).join(QLatin1Char(' '))};
+                handleSet(p2);
+            }
+            sendPrompt();
+            return;
         }
-        sendPrompt();
-        return;
     }
 
-    // -----------------------------------------------------------------------
-    // Authenticated commands
-    // -----------------------------------------------------------------------
+    expandOneLetterAuthed(cmd);
 
     if (cmd == "help")
     {
         printHelp();
     }
-    else if (cmd == "quit" || cmd == "exit")
+    else if (cmd == "bye" || cmd == "quit" || cmd == "exit")
     {
         sendLine("BYE");
         m_client->flush();
@@ -419,7 +540,7 @@ void TcpCliServer::processLine(QString const& line)
 
             emit replySignal(t, snr, dt, freq, mode, msg, false, 0);
             sendLine(QString("OK: answering %1")
-                     .arg(formatDecodeForDisplay(m_selectedDecode)));
+                     .arg(formatDecodeForDisplay(m_selectedDecode, m_selectedCountry)));
         }
     }
     else
@@ -521,22 +642,31 @@ void TcpCliServer::onSpectrum(QVector<float> savg, float df3, int nfa, int nfb)
     m_spectrumPending  = true;
 }
 
-void TcpCliServer::onDecodes(QStringList decodes)
+void TcpCliServer::onDecodes(QStringList decodes, QStringList countries)
 {
     if (!m_client || m_state == State::Unauthed) return;
 
     m_lastDecodes = decodes;
+    m_lastDecodeCountries = countries;
+    while (m_lastDecodeCountries.size() < m_lastDecodes.size())
+        m_lastDecodeCountries += QString();
+    if (m_lastDecodeCountries.size() > m_lastDecodes.size())
+        m_lastDecodeCountries = m_lastDecodeCountries.mid(0, m_lastDecodes.size());
 
     // Refresh m_selectedDecode against the new batch (freq selection persists;
     // decode at that freq may appear or disappear each period).
     if (m_selectedFreq >= 0)
     {
         m_selectedDecode.clear();
-        for (auto const& raw : m_lastDecodes)
+        m_selectedCountry.clear();
+        for (int i = 0; i < m_lastDecodes.size(); ++i)
         {
+            QString const& raw = m_lastDecodes[i];
             if (extractFreqFromDecode(raw) == m_selectedFreq)
             {
                 m_selectedDecode = raw;
+                if (i < m_lastDecodeCountries.size())
+                    m_selectedCountry = m_lastDecodeCountries[i];
                 break;
             }
         }
@@ -548,16 +678,24 @@ void TcpCliServer::onDecodes(QStringList decodes)
         // CR overwrites '> ' prompt, then bar + marker
         appendCliLog(QStringLiteral("OUT"), QStringLiteral("\\n"));
         m_client->write("\r\n");
-        sendLine(renderSpectrum(m_pendingSpectrum, m_pendingDf3,
-                                m_pendingNfa, m_pendingNfb,
-                                m_selectedFreq, m_txFirst));
+        QString specBar, specMarker;
+        renderSpectrumLines(m_pendingSpectrum, m_pendingDf3,
+                            m_pendingNfa, m_pendingNfb,
+                            m_selectedFreq, m_txFirst,
+                            specBar, specMarker);
+        sendLine(specBar);
+        if (!specMarker.isEmpty())
+            sendLine(specMarker);
         m_spectrumPending = false;
     }
 
     // Emit decode listing — keyed by audio frequency (indented under spectrum bar)
     QString const decodeIndent(kCliDecodeIndentCols, QLatin1Char(' '));
-    for (auto const& raw : decodes)
-        sendLine(decodeIndent + formatDecodeForDisplay(raw));
+    for (int i = 0; i < decodes.size(); ++i)
+    {
+        QString const& c = (i < m_lastDecodeCountries.size()) ? m_lastDecodeCountries[i] : QString();
+        sendLine(decodeIndent + formatDecodeForDisplay(decodes[i], c));
+    }
 
     sendPrompt();
 }
@@ -566,12 +704,13 @@ void TcpCliServer::onDecodes(QStringList decodes)
 // Spectrum ASCII rendering
 // ---------------------------------------------------------------------------
 
-QString TcpCliServer::renderSpectrum(QVector<float> const& savg,
-                                     float df3, int nfa, int nfb,
-                                     int selectedHz, bool txFirst) const
+void TcpCliServer::renderSpectrumLines(QVector<float> const& savg,
+                                        float df3, int nfa, int nfb,
+                                        int selectedHz, bool txFirst,
+                                        QString& barLine, QString& markerLine) const
 {
-    QString freqTag;
-    Q_UNUSED(freqTag)
+    barLine.clear();
+    markerLine.clear();
 
     // Build bar (spaces if no data)
     QString bar(m_spectrumWidth, ' ');
@@ -599,39 +738,80 @@ QString TcpCliServer::renderSpectrum(QVector<float> const& savg,
         // savg is linear averaged power (symspec.f90), not dB — use ratio → dB
         constexpr float kFloor = 1e-30f;
 
-        const QString levels {" .+\u2588"};
-        bar.clear();
-        bar.reserve(m_spectrumWidth);
+        // dB above median (per column) — same basis as before
+        QVector<float> db(m_spectrumWidth, -80.f);
         for (int c = 0; c < m_spectrumWidth; ++c)
         {
             float v = cols[c];
             if (v < kFloor) v = kFloor;
             float n = noise < kFloor ? kFloor : noise;
-            float db = 10.f * std::log10(v / n);
-            if      (db <  3.f)  bar.append(levels[0]);
-            else if (db < 10.f)  bar.append(levels[1]);
-            else if (db < 20.f)  bar.append(levels[2]);
-            else                 bar.append(levels[3]);
+            db[c] = 10.f * std::log10(v / n);
+        }
+
+        // Per-burst normalisation: map the display column dBs into [0,1] using
+        // robust percentiles (like a histogram stretch) so most of the passband
+        // stays in the “quiet” ramp but strong bins still reach @ and █. A gamma > 1
+        // darkens the mid range so plenty of space / weak glyphs remain.
+        auto pct = [](QVector<float> s, float p) -> float
+        {
+            if (s.isEmpty()) return 0.f;
+            if (p <= 0.f) return s.first();
+            if (p >= 1.f) return s.last();
+            double const pos = p * (s.size() - 1);
+            int i0 = static_cast<int>(std::floor(pos));
+            int i1 = qMin(i0 + 1, s.size() - 1);
+            float const f = static_cast<float>(pos - i0);
+            return s[i0] * (1.f - f) + s[i1] * f;
+        };
+        QVector<float> dbs = db;
+        std::sort(dbs.begin(), dbs.end());
+        constexpr float kPctLo  = 0.06f;  // noise / quiet band → bottom of map
+        constexpr float kPctHi  = 0.88f;  // high but leave headroom for outliers
+        constexpr float kMinDbSpan = 4.f; // avoid collapse when the row is almost flat
+        constexpr float kGamma  = 1.22f;  // >1: more “dark space” in the band
+        float pLo  = pct(dbs, kPctLo);
+        float pHi  = pct(dbs, kPctHi);
+        float dbSpan = std::max(pHi - pLo, kMinDbSpan);
+        // Fallback: fixed dB range if something went odd
+        constexpr float kDbLowFallback  = -4.f;
+        constexpr float kDbHighFallback = 44.f;
+
+        // 11-level ramp (weak → strong): [space] . - : = + * # % @ █
+        static QString const kRamp = QStringLiteral(" .\u002D\u003A=+*#%@\u2588");
+
+        bar.clear();
+        bar.reserve(m_spectrumWidth);
+        int const nR = kRamp.size();
+        for (int c = 0; c < m_spectrumWidth; ++c)
+        {
+            float t = (db[c] - pLo) / dbSpan;
+            if (!std::isfinite(t) || pHi <= pLo)
+                t = (db[c] - kDbLowFallback) / (kDbHighFallback - kDbLowFallback);
+            if (t < 0.f) t = 0.f;
+            else if (t > 1.f) t = 1.f;
+            float u = std::pow(t, kGamma);
+            if (u < 0.f) u = 0.f;
+            else if (u > 1.f) u = 1.f;
+            int idx = static_cast<int>(u * static_cast<float>(nR - 1) + 0.5f);
+            if (idx < 0) idx = 0;
+            else if (idx >= nR) idx = nR - 1;
+            bar.append(kRamp.at(idx));
         }
     }
 
-    QString ts = QDateTime::currentDateTimeUtc().toString("hh:mm:ss");
-    QString barLine = QString("[%1] |%2|").arg(ts).arg(bar);
+    QString const ts = QDateTime::currentDateTimeUtc().toString("hh:mm:ss");
+    barLine = QString("[%1] |%2|").arg(ts).arg(bar);
 
     // Marker line: '▲' aligned under selected freq, then "NHz, Slot"
-    // prefix '[HH:MM:SS] |' is 12 chars
-    QString markerLine;
     if (selectedHz >= 0 && nfb > nfa)
     {
-        int col = static_cast<int>(
-            static_cast<double>(selectedHz - nfa) / (nfb - nfa) * (m_spectrumWidth - 1));
-        col = qBound(0, col, m_spectrumWidth - 1);
+        int const col = qBound(0, static_cast<int>(
+            static_cast<double>(selectedHz - nfa) / (nfb - nfa) * (m_spectrumWidth - 1)),
+            m_spectrumWidth - 1);
         markerLine = QString(12 + col, ' ')
             + QChar(0x25B2)  // ▲ UP-POINTING TRIANGLE
             + QString(" %1Hz, %2").arg(selectedHz).arg(txFirst ? "Odd" : "Even");
     }
-
-    return markerLine.isEmpty() ? barLine : barLine + "\r\n" + markerLine;
 }
 
 // ---------------------------------------------------------------------------
@@ -661,22 +841,49 @@ void TcpCliServer::sendPrompt()
     m_client->flush();
 }
 
+void TcpCliServer::sendWelcomeBanner()
+{
+    sendLine("WSJT-CB CLI ready");
+    sendLine("Happy DX!");
+    sendLine("Type 'help' (h) for one-letter and full commands");
+}
+
+void TcpCliServer::tryFirstLinePassword(QString const& line)
+{
+    auto h = [](QString const& s) {
+        return QCryptographicHash::hash(s.toUtf8(), QCryptographicHash::Sha256);
+    };
+    QString const supplied = line.trimmed();
+    if (h(supplied) == h(m_password))
+    {
+        m_state = State::Idle;
+        sendWelcomeBanner();
+        sendPrompt();
+    }
+    else
+    {
+        sendLine("ERR: wrong password");
+        if (m_client)
+        {
+            m_client->flush();
+            m_client->disconnectFromHost();
+        }
+    }
+}
+
 void TcpCliServer::printHelp()
 {
-    sendLine("Commands:");
-    sendLine("  auth <password>       Authenticate (required if --cli-pass set)");
-    sendLine("  set callsign <CALL>   Set my callsign");
-    sendLine("  set grid <GRID>       Set my grid");
-    sendLine("  set odd <on|off>      Use odd time slot (TX first)");
-    sendLine("  stoptx                Stop TX and AutoSeq (cq/answer starts again)");
-    sendLine("  status                Station, TX slot, audio offset, selection, decodes");
-
-    sendLine("  select <Hz>           Select freq — sets TX+RX audio offset; optional decode target");
-
-    sendLine("  cq [<Hz>]             CQ at selected freq, or cq <Hz> to select then CQ");
-    sendLine("  answer [<Hz>]         Answer decode at selected freq, or answer <Hz> to select then answer");
-    sendLine("  help                  This help text");
-    sendLine("  quit                  Close connection");
+    sendLine("Commands  (one letter = shortcut;  f 987  and  select 987  are the same):");
+    sendLine(cliHelpLine(QStringLiteral("set callsign <CALL>"), QStringLiteral("q"), QStringLiteral("q <CALL>  -  set my callsign")));
+    sendLine(cliHelpLine(QStringLiteral("set grid <GRID>"), QStringLiteral("g"), QStringLiteral("g <GRID>  -  set my grid")));
+    sendLine(cliHelpLine(QStringLiteral("set odd <on|off>"), QStringLiteral("o"), QStringLiteral("o <on|off>  -  odd time slot (TX first)")));
+    sendLine(cliHelpLine(QStringLiteral("stoptx"), QStringLiteral("x"), QStringLiteral("Stop TX and AutoSeq; cq/answer start a new sequence")));
+    sendLine(cliHelpLine(QStringLiteral("status"), QStringLiteral("s"), QStringLiteral("Station, slot, offset, selection, decodes (pass)")));
+    sendLine(cliHelpLine(QStringLiteral("select <Hz>"), QStringLiteral("f"), QStringLiteral("f <Hz>  -  Tx+Rx audio offset")));
+    sendLine(cliHelpLine(QStringLiteral("cq [<Hz>]"), QStringLiteral("c"), QStringLiteral("CQ; c <Hz> selects that freq, then CQ")));
+    sendLine(cliHelpLine(QStringLiteral("answer [<Hz>]"), QStringLiteral("a"), QStringLiteral("Answer; a <Hz> selects, then answer")));
+    sendLine(cliHelpLine(QStringLiteral("help"), QStringLiteral("h"), QStringLiteral("This help text")));
+    sendLine(cliHelpLine(QStringLiteral("bye"), QStringLiteral("b"), QStringLiteral("Close connection; quit and exit are aliases")));
 }
 
 void TcpCliServer::printStatus()
@@ -693,7 +900,7 @@ void TcpCliServer::printStatus()
         : QStringLiteral("Even (Tx second / even FT8 cycle)");
     QString const decode = m_selectedDecode.isEmpty()
         ? QStringLiteral("(none at this audio offset)")
-        : formatDecodeForDisplay(m_selectedDecode);
+        : formatDecodeForDisplay(m_selectedDecode, m_selectedCountry);
 
     sendLine(rule);
     sendLine(QStringLiteral(" status"));
@@ -719,12 +926,12 @@ void TcpCliServer::printSelectedSlot()
         sendLine(QString("selected %1 Hz (no decode — valid for cq)").arg(m_selectedFreq));
         return;
     }
-    sendLine(QString("selected: %1").arg(formatDecodeForDisplay(m_selectedDecode)));
+    sendLine(QString("selected: %1").arg(formatDecodeForDisplay(m_selectedDecode, m_selectedCountry)));
     QStringList p = m_selectedDecode.trimmed().split(' ', Qt::SkipEmptyParts);
     if (p.size() >= 5)
     {
-        sendLine(QString("  time: %1  snr: %2 dB  dt: %3 s  freq: %4 Hz  mode: %5")
-                 .arg(p[0]).arg(p[1]).arg(p[2]).arg(p[3]).arg(p[4]));
+        sendLine(QString("  time: %1  snr: %2 dB  dt: %3 s  freq: %4 Hz")
+                 .arg(p[0]).arg(p[1]).arg(p[2]).arg(p[3]));
         if (p.size() > 5)
             sendLine(QString("  message: %1").arg(p.mid(5).join(' ')));
     }

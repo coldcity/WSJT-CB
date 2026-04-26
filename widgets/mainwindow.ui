@@ -4735,6 +4735,7 @@ QPushButton[state=&quot;ok&quot;] {
     <addaction name="actionBand_Buttons"/>
     <addaction name="actionVHF_UHF_Buttons"/>
     <addaction name="actionUse_Dark_Style"/>
+    <addaction name="actionCLI_Log"/>
    </widget>
    <widget class="QMenu" name="menuFilters">
     <property name="title">
@@ -4952,6 +4953,14 @@ QPushButton[state=&quot;ok&quot;] {
   <action name="actionWide_Waterfall">
    <property name="text">
     <string>Waterfall</string>
+   </property>
+  </action>
+  <action name="actionCLI_Log">
+   <property name="enabled">
+    <bool>false</bool>
+   </property>
+   <property name="text">
+    <string>CLI &amp;Log…</string>
    </property>
   </action>
   <action name="actionOpen">

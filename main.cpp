@@ -177,7 +177,7 @@ int main(int argc, char *argv[])
       parser.addOption (cli_port_option);
 
       QCommandLineOption cli_pass_option (QStringList {} << "cli-pass"
-                                          , "Require <password> to authenticate on the CLI port."
+                                          , "Require <password> as the first line after connect; banner follows (no auth command)."
                                           , "password");
       parser.addOption (cli_pass_option);
 

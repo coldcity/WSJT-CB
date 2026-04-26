@@ -25,6 +25,7 @@
 #include "Network/LotWUsers.hpp"
 #include "models/DecodeHighlightingModel.hpp"
 #include "logbook/logbook.h"
+#include "logbook/AD1CCty.hpp"
 #include "Radio.hpp"
 #include "Logger.hpp"
 
@@ -144,6 +145,67 @@ namespace
           }
       }
     return result;            // highest priority enabled highlighting
+  }
+
+  constexpr int kCountryColumnWidth = 12;
+
+  static QString formatEntityNameForDecodes (AD1CCty::Record const& looked_up, bool is_cb_call,
+                                            bool bPrincipalPrefix, Configuration const* config)
+  {
+    if (is_cb_call)
+      {
+        if (!looked_up.entity_name.trimmed ().isEmpty ())
+          {
+            return looked_up.entity_name;
+          }
+        return {};
+      }
+    if (bPrincipalPrefix)
+      {
+        return looked_up.primary_prefix;
+      }
+    QString countryName = looked_up.entity_name;
+    countryName.replace ("Islands", "Is.");
+    countryName.replace ("Island", "Is.");
+    countryName.replace ("North ", "N. ");
+    countryName.replace ("Northern ", "N. ");
+    countryName.replace ("South ", "S. ");
+    countryName.replace ("East ", "E. ");
+    countryName.replace ("Eastern ", "E. ");
+    countryName.replace ("West ", "W. ");
+    countryName.replace ("Western ", "W. ");
+    countryName.replace ("Central ", "C. ");
+    countryName.replace (" and ", " & ");
+    countryName.replace ("Republic", "Rep.");
+    countryName.replace ("United States Of America", "U.S.A.");
+    countryName.replace ("United States of America", "U.S.A.");
+    countryName.replace ("United States", "U.S.A.");
+    countryName.replace ("Fed. Rep. of ", "");
+    countryName.replace ("French ", "Fr.");
+    countryName.replace ("Asiatic", "AS");
+    countryName.replace ("European", "EU");
+    countryName.replace ("African", "AF");
+    if (config && !config->include_WAE_entities ())
+      {
+        countryName.replace ("Bear Is.", "Svalbard");
+        countryName.replace ("Shetland Is.", "Scotland");
+        countryName.replace ("AF Italy", "Italy");
+        countryName.replace ("Sicily", "Italy");
+        countryName.replace ("Vienna Intl Ctr", "Austria");
+        countryName.replace ("AF Turkey", "Turkey");
+        countryName.replace ("EU Turkey", "Turkey");
+      }
+    return countryName;
+  }
+
+  static QString insertCountryAfterPrefix (QString const& line, int prefixFieldLength, QString const& content)
+  {
+    if (prefixFieldLength < 0 || line.size () < prefixFieldLength)
+      {
+        return line;
+      }
+    QString const col = content.left (kCountryColumnWidth).leftJustified (kCountryColumnWidth, QLatin1Char (' '));
+    return line.left (prefixFieldLength) + col + line.mid (prefixFieldLength);
   }
 }
 
@@ -281,9 +343,8 @@ void DisplayText::new_period ()
 QString DisplayText::appendWorkedB4 (QString message, QString call, QString const& grid,
                                      QColor * bg, QColor * fg, LogBook const& logBook,
                                      QString const& currentBand, QString const& currentMode,
-                                     QString extra)
+                                     QString extra, int prefixFieldLength)
 {
-  QString countryName;
   bool callB4;
   bool callB4onBand;
   bool countryB4;
@@ -395,60 +456,23 @@ QString DisplayText::appendWorkedB4 (QString message, QString call, QString cons
   types.push_back (Highlight::CQ);
   auto top_highlight = set_colours (m_config, bg, fg, types);
 
+  QString const countryForColumn
+    = (m_config && m_config->show_country_names ())
+        ? formatEntityNameForDecodes (looked_up, is_cb_call, m_bPrincipalPrefix, m_config)
+        : QString {};
+
   auto append_country_or_prefix = [&]
     {
-      if (is_cb_call)
+      if (m_config && m_config->show_country_names ())
         {
-          if (!looked_up.entity_name.trimmed ().isEmpty ())
-            {
-              extra += looked_up.entity_name;
-            }
+          return;               // country is shown in a fixed column after the prefix, not in extra
         }
-      else
+      auto const s = formatEntityNameForDecodes (looked_up, is_cb_call, m_bPrincipalPrefix, m_config);
+      if (s.isEmpty ())
         {
-          if (m_bPrincipalPrefix)
-            {
-              extra += looked_up.primary_prefix;
-              return;
-            }
-
-          auto countryName = looked_up.entity_name;
-
-          // do some obvious abbreviations
-          countryName.replace ("Islands", "Is.");
-          countryName.replace ("Island", "Is.");
-          countryName.replace ("North ", "N. ");
-          countryName.replace ("Northern ", "N. ");
-          countryName.replace ("South ", "S. ");
-          countryName.replace ("East ", "E. ");
-          countryName.replace ("Eastern ", "E. ");
-          countryName.replace ("West ", "W. ");
-          countryName.replace ("Western ", "W. ");
-          countryName.replace ("Central ", "C. ");
-          countryName.replace (" and ", " & ");
-          countryName.replace ("Republic", "Rep.");
-          countryName.replace ("United States Of America", "U.S.A.");
-          countryName.replace ("United States of America", "U.S.A.");
-          countryName.replace ("United States", "U.S.A.");
-          countryName.replace ("Fed. Rep. of ", "");
-          countryName.replace ("French ", "Fr.");
-          countryName.replace ("Asiatic", "AS");
-          countryName.replace ("European", "EU");
-          countryName.replace ("African", "AF");
-
-          // assign WAE entities to the correct DXCC when "Include extra WAE entities" is not selected
-          if (!(m_config->include_WAE_entities())) {
-            countryName.replace ("Bear Is.", "Svalbard");
-            countryName.replace ("Shetland Is.", "Scotland");
-            countryName.replace ("AF Italy", "Italy");
-            countryName.replace ("Sicily", "Italy");
-            countryName.replace ("Vienna Intl Ctr", "Austria");
-            countryName.replace ("AF Turkey", "Turkey");
-            countryName.replace ("EU Turkey", "Turkey");
-          }
-
-          extra += countryName;
+          return;
         }
+      extra += s;
     };
 
   switch (top_highlight)
@@ -491,6 +515,10 @@ QString DisplayText::appendWorkedB4 (QString message, QString call, QString cons
     }
     m_CQPriority=DecodeHighlightingModel::highlight_name(top_highlight);
 
+    if (m_config && m_config->show_country_names ())
+      {
+        message = insertCountryAfterPrefix (message, prefixFieldLength, countryForColumn);
+      }
     if(((m_points == 00) or (m_points == -1)) and m_bDisplayPoints) return message;
     return leftJustifyAppendage (message, extra);
 }
@@ -601,7 +629,8 @@ void DisplayText::displayDecodedText(DecodedText const& decodedText, QString con
           // preformated text line t1
           auto currentMode = mode;
           message = appendWorkedB4 (message, dxCall, dxGrid, &bg, &fg
-                                    , logBook, currentBand, currentMode, extra);
+                                    , logBook, currentBand, currentMode, extra
+                                    , decodedText.prefixFieldLength ());
         }
       else
         {
@@ -620,51 +649,10 @@ void DisplayText::displayDecodedText(DecodedText const& decodedText, QString con
         {
           auto const& looked_up = logBook.countries ()->lookup (dxCall);
           auto const is_cb_call = Radio::is_cb_callsign (Radio::base_callsign (dxCall).trimmed ());
-          auto countryName = looked_up.entity_name;
-
-          if (is_cb_call) {
-              if (!countryName.trimmed ().isEmpty ()) {
-                  extra += countryName;
-              }
-          } else if (m_bPrincipalPrefix) {
-              extra += looked_up.primary_prefix;
-          } else {
-              // do some obvious abbreviations
-              countryName.replace ("Islands", "Is.");
-              countryName.replace ("Island", "Is.");
-              countryName.replace ("North ", "N. ");
-              countryName.replace ("Northern ", "N. ");
-              countryName.replace ("South ", "S. ");
-              countryName.replace ("East ", "E. ");
-              countryName.replace ("Eastern ", "E. ");
-              countryName.replace ("West ", "W. ");
-              countryName.replace ("Western ", "W. ");
-              countryName.replace ("Central ", "C. ");
-              countryName.replace (" and ", " & ");
-              countryName.replace ("Republic", "Rep.");
-              countryName.replace ("United States Of America", "U.S.A.");
-              countryName.replace ("United States of America", "U.S.A.");
-              countryName.replace ("United States", "U.S.A.");
-              countryName.replace ("Fed. Rep. of ", "");
-              countryName.replace ("French ", "Fr.");
-              countryName.replace ("Asiatic", "AS");
-              countryName.replace ("European", "EU");
-              countryName.replace ("African", "AF");
-
-              // assign WAE entities to the correct DXCC when "Include extra WAE entities" is not selected
-              if (!(m_config->include_WAE_entities())) {
-                countryName.replace ("Bear Is.", "Svalbard");
-                countryName.replace ("Shetland Is.", "Scotland");
-                countryName.replace ("AF Italy", "Italy");
-                countryName.replace ("Sicily", "Italy");
-                countryName.replace ("Vienna Intl Ctr", "Austria");
-                countryName.replace ("AF Turkey", "Turkey");
-                countryName.replace ("EU Turkey", "Turkey");
-              }
-
-              extra += countryName;
-          }
-          message = leftJustifyAppendage(message, extra);
+          QString const countryCol
+            = formatEntityNameForDecodes (looked_up, is_cb_call, m_bPrincipalPrefix, m_config);
+          message = insertCountryAfterPrefix (message, decodedText.prefixFieldLength (), countryCol);
+          message = leftJustifyAppendage (message, extra);
         }
       else
         {
@@ -709,20 +697,22 @@ void DisplayText::displayDecodedText(DecodedText const& decodedText, QString con
 
   // display distance and azimuth
   if (distance.length() > 0) {
+      int const countryColumnDelta
+        = (m_config->show_country_names () ? kCountryColumnWidth : 0);
       if (m_config->align()) {
           if (!displayDXCCEntity) {
               message = leftJustifyAppendage (message, "[" + distance + "]");
           } else {
               QString space = " ";
               if (m_bPrincipalPrefix) {
-                  if (message.length() < (49 + m_config->align_steps() + m_config->align_steps2())) {
-                      message = leftJustifyAppendage ((message + (space.repeated(30))).left(48 + m_config->align_steps() + m_config->align_steps2()), "[" + distance + "]");
+                  if (message.length() < (49 + countryColumnDelta + m_config->align_steps() + m_config->align_steps2())) {
+                      message = leftJustifyAppendage ((message + (space.repeated(30))).left(48 + countryColumnDelta + m_config->align_steps() + m_config->align_steps2()), "[" + distance + "]");
                   } else {
                       message = leftJustifyAppendage (message, " [" + distance + "]");
                   }
               } else {
-                  if (message.length() < 59 + m_config->align_steps() + m_config->align_steps2()) {
-                      message = leftJustifyAppendage ((message + (space.repeated(40))).left(59 + m_config->align_steps() + m_config->align_steps2()), "[" + distance + "]");
+                  if (message.length() < 59 + countryColumnDelta + m_config->align_steps() + m_config->align_steps2()) {
+                      message = leftJustifyAppendage ((message + (space.repeated(40))).left(59 + countryColumnDelta + m_config->align_steps() + m_config->align_steps2()), "[" + distance + "]");
                   } else {
                       message = leftJustifyAppendage (message, "[" + distance + "]");
                   }
