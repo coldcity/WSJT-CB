@@ -13245,7 +13245,8 @@ void MainWindow::replyToCQ (QTime time, qint32 snr, float delta_time, quint32 de
                                                           .arg (mode, -2)
                                                           .arg (text), start, QTextDocument::FindBackward);
     }
-  if (!cursor.isNull ())
+  bool const in_decode_window = !cursor.isNull ();
+  if (in_decode_window)
     {
       if (m_config.udpWindowToFront ())
         {
@@ -13263,16 +13264,20 @@ void MainWindow::replyToCQ (QTime time, qint32 snr, float delta_time, quint32 de
         // a message we are willing to accept and auto reply to
         m_bDoubleClicked = true;
       }
-      DecodedText message {message_line};
-      Qt::KeyboardModifiers kbmod {modifiers << 24};
-      processMessage (message, kbmod);
-      tx_watchdog (false);
-      QApplication::alert (this);
     }
   else
     {
-      qDebug () << "process reply message ignored, decode not found:" << message_line;
+      // e.g. TCP CLI "answer" or decode only in the other window: still run
+      // processMessage so Tx first/odd–even is set from decode time (same as
+      // double–click) and AutoSeq can run.
+      m_bDoubleClicked = true;
+      qDebug () << "replyToCQ: decode not in main window, processing anyway:" << message_line;
     }
+  DecodedText message {message_line};
+  Qt::KeyboardModifiers kbmod {modifiers << 24};
+  processMessage (message, kbmod);
+  tx_watchdog (false);
+  if (in_decode_window) QApplication::alert (this);
 }
 
 void MainWindow::locationChange (QString const& location)

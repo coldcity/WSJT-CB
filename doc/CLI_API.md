@@ -84,7 +84,7 @@ Set Maidenhead grid locator (e.g. `JO22`). Regenerates TX messages.
 ```
 set odd <on|off>
 ```
-`set odd on` enables odd time slot TX (the "Tx first" checkbox); `set odd off` disables it.
+`set odd on` enables odd time slot TX (the "Tx first" checkbox); `set odd off` disables it. Use this to choose which half of the FT8 period you **call CQ in** (first vs second). It does not replace the automatic rule used when **replying** — see `answer` below.
 
 ```
 status
@@ -182,7 +182,7 @@ The default frequency on connect is **1200 Hz**.
 ```
 answer [<FREQ>]
 ```
-Reply to the decode at the selected frequency. With **`answer <FREQ>`** (e.g. `answer 2135`), the CLI selects that audio offset first (same as `select <FREQ>`), then replies — one step instead of `select` then `answer`. Triggers the same pathway as clicking a decode in the UI — WSJT-CB AutoSeq takes over and manages the full QSO exchange automatically. Returns an error if no decode exists at the selected frequency (after any optional `select` implied by `answer <FREQ>`).
+Reply to the decode at the selected frequency. With **`answer <FREQ>`** (e.g. `answer 2135`), the CLI selects that audio offset first (same as `select <FREQ>`), then replies — one step instead of `select` then `answer`. This invokes the same **`processMessage` / AutoSeq** path as a **double–click in the main decode list**, including **automatic “Tx first” (odd / even)** from the **decode’s time stamp** (the same `nmod` rule the GUI uses) so you transmit in the **correct half of the T/R period** relative to the station you are answering, not your prior `set odd` choice. (Fox / Hound and other special modes still apply the usual constraints.) The CLI works even if that decode line is not visible in the main window, as long as the parameters match the last burst. Returns an error if no decode exists at the selected frequency (after any optional `select` implied by `answer <FREQ>`).
 
 ```
 cq [<FREQ>]
