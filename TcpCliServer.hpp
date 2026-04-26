@@ -2,6 +2,7 @@
 #define TCP_CLI_SERVER_HPP
 
 #include <QObject>
+#include <QFile>
 #include <QHostAddress>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -33,7 +34,7 @@ public:
     explicit TcpCliServer(quint16 port, QString const& password,
                          QHostAddress bindAddress = QHostAddress::AnyIPv4,
                          QObject* parent = nullptr);
-    ~TcpCliServer() override = default;
+    ~TcpCliServer() override;
 
     bool isListening() const;
 
@@ -45,6 +46,7 @@ public:
     Q_SLOT void onTxStart(QString message);
     Q_SLOT void onTxStop();
     Q_SLOT void onTxFirstChanged(bool txFirst);
+    Q_SLOT void setStationSnapshot(QString const& callsign, QString const& grid);
 
     // -----------------------------------------------------------------------
     // Outbound: TX actions
@@ -65,8 +67,8 @@ public:
     Q_SIGNAL void setCallsignSignal(QString callsign);
     Q_SIGNAL void setGridSignal(QString grid);
 
-    // Fires for "set halt on|off" — enables/disables TX (autoButton)
-    Q_SIGNAL void setAutoSignal(bool enabled);
+    // Fires for "stoptx" — same as main-window Stop Tx (halt RF + end AutoSeq until next cq/answer)
+    Q_SIGNAL void stopTxSignal();
 
     // Fires for "set rxfreq <Hz>" / select
     Q_SIGNAL void setRxAudioFreqSignal(int hz);
@@ -85,7 +87,13 @@ private:
     void processLine(QString const& line);
     void handleSet(QStringList const& parts);
 
+    // Select audio Hz, update TX/RX, refresh m_selectedDecode from m_lastDecodes.
+    // Sends ERR/OK lines; returns false if selection failed.
+    bool trySelectAudioFreq(int freqHz);
+
     void sendLine(QString const& text);
+    // CR+LF so async lines appear below the `> ` prompt (terminal has no echo newline)
+    void sendLineAfterNewline(QString const& text);
     void sendPrompt();
     void printHelp();
     void printStatus();
@@ -93,6 +101,8 @@ private:
 
     // Spectrum rendering
     QString renderSpectrum(QVector<float> const& savg, float df3, int nfa, int nfb, int selectedHz, bool txFirst) const;
+
+    void appendCliLog(QString const& role, QString const& text);
 
     QTcpServer    m_server;
     QTcpSocket*   m_client {nullptr};
@@ -117,6 +127,13 @@ private:
 
     bool           m_spectrumPending {false};
     bool           m_txFirst         {false}; // mirrors MainWindow::m_txFirst
+
+    QString        m_myCallsign;      // mirrored from MainWindow / config (for status)
+    QString        m_myGrid;
+
+    QString        m_lastTxMessage;   // last message passed to onTxStart (for TX STOP line)
+
+    QFile          m_cliLog;          // append-only transcript: exe dir / wsjtcb-cli.log
 };
 
 #endif // TCP_CLI_SERVER_HPP

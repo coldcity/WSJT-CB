@@ -13392,11 +13392,8 @@ void MainWindow::connectCli (TcpCliServer* cli)
     if (!m_auto) auto_tx_mode (true);
   });
 
-  // CLI "set halt on|off" → enable/disable TX (autoButton)
-  connect (cli, &TcpCliServer::setAutoSignal, this, [this](bool enable) {
-    if (ui->autoButton->isChecked () != enable)
-      ui->autoButton->click ();
-  });
+  // CLI "stoptx" → same as Stop Tx button (end sequence until next cq/answer)
+  connect (cli, &TcpCliServer::stopTxSignal, this, &MainWindow::on_stopTxButton_clicked);
 
   // CLI "select" / "set rxfreq" → RX audio offset
   connect (cli, &TcpCliServer::setRxAudioFreqSignal, this, [this](int hz) {
@@ -13410,16 +13407,24 @@ void MainWindow::connectCli (TcpCliServer* cli)
   });
 
   // CLI "set callsign" → update config + refresh TX messages
-  connect (cli, &TcpCliServer::setCallsignSignal, this, [this](QString const& call) {
+  connect (cli, &TcpCliServer::setCallsignSignal, this, [this, cli](QString const& call) {
     m_config.set_my_callsign (call);
     m_baseCall = Radio::base_callsign (call);
     genStdMsgs (m_rpt, true);
+    cli->setStationSnapshot (m_config.my_callsign (), m_config.my_grid ());
   });
 
   // CLI "set grid" / "set location" → update config + refresh TX messages
-  connect (cli, &TcpCliServer::setGridSignal, this, [this](QString const& grid) {
+  connect (cli, &TcpCliServer::setGridSignal, this, [this, cli](QString const& grid) {
     m_config.set_my_grid (grid);
     genStdMsgs (m_rpt, true);
+    cli->setStationSnapshot (m_config.my_callsign (), m_config.my_grid ());
+  });
+
+  // Mirror station identity for CLI `status` (seed + settings dialog + CLI set above)
+  cli->setStationSnapshot (m_config.my_callsign (), m_config.my_grid ());
+  connect (&m_config, &Configuration::leavingSettings, cli, [cli, this] (bool) {
+    cli->setStationSnapshot (m_config.my_callsign (), m_config.my_grid ());
   });
 }
 

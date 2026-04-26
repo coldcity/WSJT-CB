@@ -1,12 +1,31 @@
 #include "TcpCliServer.hpp"
 
+#include <QCoreApplication>
 #include <QHostAddress>
 #include <QDateTime>
 #include <QCryptographicHash>
+#include <QIODevice>
 #include <QVector>
 #include <QtMath>
 #include <algorithm>
 #include <cmath>
+
+// ---------------------------------------------------------------------------
+// CLI transcript log (exe directory, append-only)
+// ---------------------------------------------------------------------------
+
+void TcpCliServer::appendCliLog(QString const& role, QString const& text)
+{
+    if (!m_cliLog.isOpen())
+        return;
+    QString t = text;
+    t.replace(QLatin1Char('\r'), QStringLiteral("\\r"));
+    t.replace(QLatin1Char('\n'), QStringLiteral("\\n"));
+    QString const line = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)
+        + QLatin1Char(' ') + role + QLatin1Char(' ') + t + QLatin1Char('\n');
+    m_cliLog.write(line.toUtf8());
+    m_cliLog.flush();
+}
 
 // ---------------------------------------------------------------------------
 // Construction / listen
@@ -17,6 +36,19 @@ TcpCliServer::TcpCliServer(quint16 port, QString const& password,
     : QObject(parent)
     , m_password(password)
 {
+    QString const logPath = QCoreApplication::applicationDirPath()
+        + QStringLiteral("/wsjtcb-cli.log");
+    m_cliLog.setFileName(logPath);
+    if (!m_cliLog.open(QIODevice::Append))
+    {
+        qWarning("TcpCliServer: could not open CLI log %s: %s",
+                 qPrintable(logPath), qPrintable(m_cliLog.errorString()));
+    }
+    else
+    {
+        appendCliLog(QStringLiteral("SYS"), QStringLiteral("log opened ") + logPath);
+    }
+
     connect(&m_server, &QTcpServer::newConnection,
             this,      &TcpCliServer::onNewConnection);
 
@@ -30,6 +62,15 @@ TcpCliServer::TcpCliServer(quint16 port, QString const& password,
     {
         qInfo("TcpCliServer: listening on %s:%d",
               qPrintable(bindAddress.toString()), port);
+    }
+}
+
+TcpCliServer::~TcpCliServer()
+{
+    if (m_cliLog.isOpen())
+    {
+        appendCliLog(QStringLiteral("SYS"), QStringLiteral("TcpCliServer shutdown"));
+        m_cliLog.close();
     }
 }
 
@@ -49,6 +90,8 @@ void TcpCliServer::onNewConnection()
     if (m_client && m_client->state() == QAbstractSocket::ConnectedState)
     {
         // Reject second connection
+        appendCliLog(QStringLiteral("OUT"),
+                     QStringLiteral("ERR: already connected (duplicate client rejected)"));
         incoming->write("ERR: already connected\r\n");
         incoming->flush();
         incoming->disconnectFromHost();
@@ -67,11 +110,18 @@ void TcpCliServer::onNewConnection()
     connect(m_client, &QTcpSocket::readyRead,
             this,     &TcpCliServer::onReadyRead);
 
+    appendCliLog(QStringLiteral("SYS"),
+                 QStringLiteral("client connected %1:%2")
+                     .arg(m_client->peerAddress().toString())
+                     .arg(m_client->peerPort()));
+
     sendLine("WSJT-CB CLI ready");
     if (m_state == State::Unauthed)
         sendLine("AUTH required — type: auth <password>");
-    else
+    else {
+        sendLine("Happy DX!");
         sendLine("Type 'help' for commands");
+    }
     sendPrompt();
 }
 
@@ -79,6 +129,9 @@ void TcpCliServer::onClientDisconnected()
 {
     if (m_client)
     {
+        appendCliLog(QStringLiteral("SYS"),
+                     QStringLiteral("client disconnected %1")
+                         .arg(m_client->peerAddress().toString()));
         m_client->deleteLater();
         m_client = nullptr;
     }
@@ -107,13 +160,21 @@ void TcpCliServer::onReadyRead()
         m_readBuf    = m_readBuf.mid(idx + 1);
 
         if (!line.isEmpty())
+        {
+            QString logLine = line;
+            if (line.startsWith(QStringLiteral("auth "), Qt::CaseInsensitive))
+                logLine = QStringLiteral("auth ***REDACTED***");
+            appendCliLog(QStringLiteral("IN"), logLine);
             processLine(line);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Decode string helpers
 // ---------------------------------------------------------------------------
+
+static constexpr int kCliDecodeIndentCols = 11;
 
 // Raw decode format (space-separated, skip empties):
 //   [0] time (HHMM or HHMMSS)
@@ -148,6 +209,48 @@ static QString formatDecodeForDisplay(QString const& raw)
     if (p.size() > 5)
         body << p.mid(5);                     // message words
     return QString("[%1] %2").arg(freq).arg(body.join("  "));
+}
+
+// ---------------------------------------------------------------------------
+// select <Hz> — shared by select / answer <Hz> / cq <Hz>
+// ---------------------------------------------------------------------------
+
+bool TcpCliServer::trySelectAudioFreq(int freqHz)
+{
+    if (freqHz <= 0)
+    {
+        sendLine("ERR: usage: select <audio-freq-Hz>  (positive integer, e.g. 987)");
+        return false;
+    }
+    if ((m_pendingNfa > 0 || m_pendingNfb > 0) &&
+        (freqHz < m_pendingNfa || freqHz > m_pendingNfb))
+    {
+        sendLine(QString("ERR: %1 Hz is outside active window (%2\xe2\x80\x93%3 Hz)")
+                 .arg(freqHz).arg(m_pendingNfa).arg(m_pendingNfb));
+        return false;
+    }
+
+    m_selectedFreq = freqHz;
+    m_selectedDecode.clear();
+    for (auto const& raw : m_lastDecodes)
+    {
+        if (extractFreqFromDecode(raw) == freqHz)
+        {
+            m_selectedDecode = raw;
+            break;
+        }
+    }
+
+    emit setTxAudioFreqSignal(freqHz);
+    emit setRxAudioFreqSignal(freqHz);
+
+    if (m_selectedDecode.isEmpty())
+        sendLine(QString("OK: selected %1 Hz (no decode here — valid for cq)")
+                 .arg(freqHz));
+    else
+        sendLine(QString("OK: selected %1")
+                 .arg(formatDecodeForDisplay(m_selectedDecode)));
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,50 +335,66 @@ void TcpCliServer::processLine(QString const& line)
         {
             bool ok;
             int freqHz = parts[1].toInt(&ok);
-            if (!ok || freqHz <= 0)
-            {
+            if (!ok)
                 sendLine("ERR: usage: select <audio-freq-Hz>  (positive integer, e.g. 987)");
-            }
-            else if ((m_pendingNfa > 0 || m_pendingNfb > 0) &&
-                     (freqHz < m_pendingNfa || freqHz > m_pendingNfb))
-            {
-                sendLine(QString("ERR: %1 Hz is outside active window (%2\xe2\x80\x93%3 Hz)")
-                         .arg(freqHz).arg(m_pendingNfa).arg(m_pendingNfb));
-            }
             else
-            {
-                m_selectedFreq = freqHz;
-                m_selectedDecode.clear();
-                for (auto const& raw : m_lastDecodes)
-                {
-                    if (extractFreqFromDecode(raw) == freqHz)
-                    {
-                        m_selectedDecode = raw;
-                        break;
-                    }
-                }
-
-                // Set TX and RX audio frequency immediately
-                emit setTxAudioFreqSignal(freqHz);
-                emit setRxAudioFreqSignal(freqHz);
-
-                if (m_selectedDecode.isEmpty())
-                    sendLine(QString("OK: selected %1 Hz (no decode here — valid for cq)")
-                             .arg(freqHz));
-                else
-                    sendLine(QString("OK: selected %1")
-                             .arg(formatDecodeForDisplay(m_selectedDecode)));
-            }
+                trySelectAudioFreq(freqHz);
         }
     }
     else if (cmd == "cq")
     {
-        emit setTxAudioFreqSignal(m_selectedFreq);
-        emit startCQSignal();   // MainWindow enables auto at next slot boundary
-        sendLine(QString("OK: CQ queued at %1 Hz — will TX at next slot boundary").arg(m_selectedFreq));
+        if (parts.size() >= 2)
+        {
+            bool ok;
+            int freqHz = parts[1].toInt(&ok);
+            if (!ok || freqHz <= 0)
+            {
+                sendLine("ERR: usage: cq  OR  cq <audio-freq-Hz>  (positive integer)");
+            }
+            else if (!trySelectAudioFreq(freqHz))
+            {
+                // error already reported
+            }
+            else
+            {
+                emit setTxAudioFreqSignal(m_selectedFreq);
+                emit startCQSignal();
+                sendLine(QString("OK: CQ queued at %1 Hz — will TX at next slot boundary")
+                         .arg(m_selectedFreq));
+            }
+        }
+        else
+        {
+            emit setTxAudioFreqSignal(m_selectedFreq);
+            emit startCQSignal();   // MainWindow enables auto at next slot boundary
+            sendLine(QString("OK: CQ queued at %1 Hz — will TX at next slot boundary")
+                     .arg(m_selectedFreq));
+        }
+    }
+    else if (cmd == "stoptx")
+    {
+        emit stopTxSignal();
+        sendLine("OK: TX stopped — use cq or answer to start a new sequence");
     }
     else if (cmd == "answer")
     {
+        if (parts.size() >= 2)
+        {
+            bool ok;
+            int freqHz = parts[1].toInt(&ok);
+            if (!ok || freqHz <= 0)
+            {
+                sendLine("ERR: usage: answer  OR  answer <audio-freq-Hz>  (positive integer)");
+                sendPrompt();
+                return;
+            }
+            if (!trySelectAudioFreq(freqHz))
+            {
+                sendPrompt();
+                return;
+            }
+        }
+
         if (m_selectedDecode.isEmpty())
         {
             sendLine(QString("ERR: no decode at %1 Hz — 'answer' requires a decoded station")
@@ -351,12 +470,6 @@ void TcpCliServer::handleSet(QStringList const& parts)
         emit setTxFirstSignal(enable);
         sendLine(QString("OK: odd time slot TX %1").arg(enable ? "enabled" : "disabled"));
     }
-    else if (key == "halt")
-    {
-        bool enable = (value == "off" || value == "0" || value == "false");
-        emit setAutoSignal(enable);
-        sendLine(QString("OK: TX %1").arg(enable ? "enabled" : "halted"));
-    }
     else
     {
         sendLine(QString("ERR: unknown set key '%1'").arg(key));
@@ -370,23 +483,33 @@ void TcpCliServer::handleSet(QStringList const& parts)
 void TcpCliServer::onTxStart(QString message)
 {
     if (m_state == State::Unauthed || !m_client) return;
-    QString freqTag = (m_selectedFreq >= 0)
-        ? QString(" %1Hz").arg(m_selectedFreq)
-        : QString();
-    QString slotTag = m_txFirst ? " Odd" : " Even";
-    sendLine(QString("[%1%2%3] TX: %3").arg(freqTag).arg(slotTag).arg(message));
+    m_lastTxMessage = message;
+    QString const ts = QDateTime::currentDateTimeUtc().toString("hh:mm:ss");
+    sendLineAfterNewline(QString("[%1] !!! TX: %2").arg(ts).arg(message));
+    sendPrompt();
 }
 
 void TcpCliServer::onTxStop()
 {
     if (m_state == State::Unauthed || !m_client) return;
-    sendLine("TX STOP");
+    QString const ts = QDateTime::currentDateTimeUtc().toString("hh:mm:ss");
+    if (m_lastTxMessage.isEmpty())
+        sendLineAfterNewline(QString("[%1] !!! TX STOP").arg(ts));
+    else
+        sendLineAfterNewline(QString("[%1] !!! TX STOP (%2)").arg(ts).arg(m_lastTxMessage));
+    m_lastTxMessage.clear();
     sendPrompt();
 }
 
 void TcpCliServer::onTxFirstChanged(bool txFirst)
 {
     m_txFirst = txFirst;
+}
+
+void TcpCliServer::setStationSnapshot(QString const& callsign, QString const& grid)
+{
+    m_myCallsign = callsign.trimmed();
+    m_myGrid     = grid.trimmed();
 }
 
 void TcpCliServer::onSpectrum(QVector<float> savg, float df3, int nfa, int nfb)
@@ -423,6 +546,7 @@ void TcpCliServer::onDecodes(QStringList decodes)
     if (m_spectrumPending && !m_pendingSpectrum.isEmpty())
     {
         // CR overwrites '> ' prompt, then bar + marker
+        appendCliLog(QStringLiteral("OUT"), QStringLiteral("\\n"));
         m_client->write("\r\n");
         sendLine(renderSpectrum(m_pendingSpectrum, m_pendingDf3,
                                 m_pendingNfa, m_pendingNfb,
@@ -430,9 +554,10 @@ void TcpCliServer::onDecodes(QStringList decodes)
         m_spectrumPending = false;
     }
 
-    // Emit decode listing — keyed by audio frequency
+    // Emit decode listing — keyed by audio frequency (indented under spectrum bar)
+    QString const decodeIndent(kCliDecodeIndentCols, QLatin1Char(' '));
     for (auto const& raw : decodes)
-        sendLine(formatDecodeForDisplay(raw));
+        sendLine(decodeIndent + formatDecodeForDisplay(raw));
 
     sendPrompt();
 }
@@ -471,13 +596,18 @@ QString TcpCliServer::renderSpectrum(QVector<float> const& savg,
         QVector<float> sorted = cols;
         std::sort(sorted.begin(), sorted.end());
         float noise = sorted[sorted.size() / 2];
+        // savg is linear averaged power (symspec.f90), not dB — use ratio → dB
+        constexpr float kFloor = 1e-30f;
 
         const QString levels {" .+\u2588"};
         bar.clear();
         bar.reserve(m_spectrumWidth);
         for (int c = 0; c < m_spectrumWidth; ++c)
         {
-            float db = cols[c] - noise;
+            float v = cols[c];
+            if (v < kFloor) v = kFloor;
+            float n = noise < kFloor ? kFloor : noise;
+            float db = 10.f * std::log10(v / n);
             if      (db <  3.f)  bar.append(levels[0]);
             else if (db < 10.f)  bar.append(levels[1]);
             else if (db < 20.f)  bar.append(levels[2]);
@@ -510,12 +640,22 @@ QString TcpCliServer::renderSpectrum(QVector<float> const& savg,
 
 void TcpCliServer::sendLine(QString const& text)
 {
+    appendCliLog(QStringLiteral("OUT"), text);
     if (!m_client) return;
     m_client->write((text + "\r\n").toUtf8());
 }
 
+void TcpCliServer::sendLineAfterNewline(QString const& text)
+{
+    appendCliLog(QStringLiteral("OUT"), QStringLiteral("\\n"));
+    if (!m_client) return;
+    m_client->write("\r\n");
+    sendLine(text);
+}
+
 void TcpCliServer::sendPrompt()
 {
+    appendCliLog(QStringLiteral("OUT"), QStringLiteral("> "));
     if (!m_client) return;
     m_client->write("> ");
     m_client->flush();
@@ -527,27 +667,44 @@ void TcpCliServer::printHelp()
     sendLine("  auth <password>       Authenticate (required if --cli-pass set)");
     sendLine("  set callsign <CALL>   Set my callsign");
     sendLine("  set grid <GRID>       Set my grid");
-    sendLine("  set halt <on|off>     Halt/resume automatic TX");
     sendLine("  set odd <on|off>      Use odd time slot (TX first)");
-    sendLine("  status                Show current state");
+    sendLine("  stoptx                Stop TX and AutoSeq (cq/answer starts again)");
+    sendLine("  status                Station, TX slot, audio offset, selection, decodes");
 
     sendLine("  select <Hz>           Select freq — sets TX+RX audio offset; optional decode target");
 
-    sendLine("  cq                    Send CQ at selected freq (no decode needed)");
-    sendLine("  answer                Reply to decode at selected freq (decode required)");
+    sendLine("  cq [<Hz>]             CQ at selected freq, or cq <Hz> to select then CQ");
+    sendLine("  answer [<Hz>]         Answer decode at selected freq, or answer <Hz> to select then answer");
     sendLine("  help                  This help text");
     sendLine("  quit                  Close connection");
 }
 
 void TcpCliServer::printStatus()
 {
-    QString decode = m_selectedDecode.isEmpty()
-        ? "(no decode)"
+    QString const rule(44, QLatin1Char('-'));
+    QString const callShow = m_myCallsign.isEmpty()
+        ? QStringLiteral("(not set)")
+        : m_myCallsign;
+    QString const gridShow = m_myGrid.isEmpty()
+        ? QStringLiteral("(not set)")
+        : m_myGrid;
+    QString const slotShow = m_txFirst
+        ? QStringLiteral("Odd  (Tx first / odd FT8 cycle)")
+        : QStringLiteral("Even (Tx second / even FT8 cycle)");
+    QString const decode = m_selectedDecode.isEmpty()
+        ? QStringLiteral("(none at this audio offset)")
         : formatDecodeForDisplay(m_selectedDecode);
-    sendLine(QString("selected: %1 Hz  %2  decodes this period: %3")
-             .arg(m_selectedFreq)
-             .arg(decode)
-             .arg(m_lastDecodes.size()));
+
+    sendLine(rule);
+    sendLine(QStringLiteral(" status"));
+    sendLine(rule);
+    sendLine(QStringLiteral("  Callsign        %1").arg(callShow));
+    sendLine(QStringLiteral("  Grid            %1").arg(gridShow));
+    sendLine(QStringLiteral("  TX time slot    %1").arg(slotShow));
+    sendLine(QStringLiteral("  Audio offset    %1 Hz  (Tx + Rx)").arg(m_selectedFreq));
+    sendLine(QStringLiteral("  Selection       %1").arg(decode));
+    sendLine(QStringLiteral("  Decodes (pass)  %1").arg(m_lastDecodes.size()));
+    sendLine(rule);
 }
 
 void TcpCliServer::printSelectedSlot()
