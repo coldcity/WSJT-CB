@@ -14045,6 +14045,10 @@ void MainWindow::connectCli (TcpCliServer* cli)
       [this] (QString const& recv) {
         return cliCountryForSpottedReceiver (recv);
       });
+  cli->setAnswerWorkedTodayRejector (
+      [this] (QString const& dxBaseUpper) {
+        return m_logBook.call_worked_on_local_calendar_day (dxBaseUpper);
+      });
 
   ui->actionCLI_Log->setEnabled (true);
 }

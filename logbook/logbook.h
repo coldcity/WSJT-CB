@@ -49,6 +49,11 @@ public:
 
   QString const cty_version() const;
 
+  bool call_worked_on_local_calendar_day (QString const& dx_base_call_upper) const
+  {
+    return worked_before_.call_worked_on_local_calendar_day (dx_base_call_upper);
+  }
+
   Q_SIGNAL void finished_loading (int worked_before_record_count, QString const cty_version, QString const& error) const;
 
   CabrilloLog * contest_log ();

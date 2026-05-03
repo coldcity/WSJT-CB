@@ -78,6 +78,10 @@ public:
     /** PSK Reporter \c spots rows include a shortened DXCC territory for \a receiverCallsign (from CTY lookup). Unset ⇒ em dash column. */
     void setSpotsReceiverCountryFormatter (std::function<QString (QString const& receiverCallsign)> formatter);
 
+    /** If non-empty and returns true for the selected DX (\c Radio::base_callsign-shaped upper token), \c answer rejects with ERR. Uses main ADIF log QSO_DATE + local calendar. */
+    void setAnswerWorkedTodayRejector (
+        std::function<bool (QString const& dx_base_upper)> pred);
+
     // -----------------------------------------------------------------------
     // Outbound: TX actions
     // Wired by MainWindow::connectCli() to private MainWindow slots.
@@ -127,8 +131,8 @@ private:
     void handleSet(QStringList const& parts);
 
     // Select audio Hz, update TX/RX, snapshot decode + DX base at that Hz (CQ slot → no DX lock).
-    // Sends ERR/OK lines; returns false if selection failed.
-    // When \a sendOkOnSuccess is false, selection state is updated but no **`OK: selected …`** line is sent (used by **`answer <Hz>`** so only **`OK: answering …`** appears).
+    // Sends ERR on failure; on success sends OK lines only when sendOkOnSuccess (implicit select for answer does not).
+    // When sendOkOnSuccess is false (implicit select for answer <Hz>), no OK: selected line on the wire.
     bool trySelectAudioFreq(int freqHz, bool sendOkOnSuccess = true);
 
     void sendLine(QString const& text);
@@ -194,6 +198,9 @@ private:
     QTimer                    m_pskspotsAutoTimer;
 
     std::function<QString (QString const&)> m_spotsRcvrCountryFmt;
+
+    /** Non-empty ⇒ \c answer consults before TX; predicate true ⇒ ERR (already logged this DX today local date). */
+    std::function<bool (QString const&)> m_answerWorkedTodayPred;
 };
 
 #endif // TCP_CLI_SERVER_HPP

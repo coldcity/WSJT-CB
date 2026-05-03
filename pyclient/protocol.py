@@ -179,7 +179,7 @@ def cq_caller_station(msg: str) -> str | None:
         return None
     return call
 
-``
+
 def chase_identity(call: str) -> str:
     """
     Normalize for "same ham" CQ chasing: M3ABC/P matches M3ABC; W1AW/4 matches W1AW.

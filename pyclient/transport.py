@@ -119,7 +119,6 @@ async def open_session(
     )
     s = CliSession(reader=reader, writer=writer, transcript_outbound=transcript_outbound)
     await s.login(password)
-    log.info("CLI session ready (welcome: %d lines)", len(s.welcome_lines))
     return s
 
 

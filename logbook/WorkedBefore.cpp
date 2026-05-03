@@ -19,9 +19,13 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QFile>
+#include <QHash>
+#include <QSet>
+#include <QDate>
 #include <QTextStream>
 #include <QDateTime>
 #include "Configuration.hpp"
+#include "Radio.hpp"
 #include "revision_utils.hpp"
 #include "Logger.hpp"
 #include "qt_helpers.hpp"
@@ -222,6 +226,12 @@ typedef multi_index_container<
                                      member<worked_entry, QString, &worked_entry::band_> > > >
   > worked_before_database_type;
 
+struct worked_before_load_bundle final
+{
+  worked_before_database_type worked;
+  QHash<QString, QSet<QDate>> calendar_by_dx_base_upper;
+};
+
 namespace
 {
   auto const logFileName = "wsjtcb_log.adi";
@@ -279,9 +289,55 @@ namespace
     return QString {};
   }
 
-  worked_before_database_type loader (QString const& path, AD1CCty const * prefixes)
+  void calendar_merge_qso_date_from_adif_fields (QHash<QString, QSet<QDate>>& by_base,
+                                                 QString const& callField,
+                                                 QString const& record)
   {
-    worked_before_database_type worked;
+    QString const base =
+        Radio::base_callsign (callField).trimmed ().toUpper ();
+    if (base.isEmpty ())
+      {
+        return;
+      }
+    QString const qd = extractField (record, QStringLiteral ("QSO_DATE")).trimmed ();
+    if (qd.size () < 8)
+      {
+        return;
+      }
+    QDate const d = QDate::fromString (qd.left (8), QLatin1String ("yyyyMMdd"));
+    if (!d.isValid ())
+      {
+        return;
+      }
+    by_base[base].insert (d);
+  }
+
+  void calendar_merge_after_append (QHash<QString, QSet<QDate>>& by_base,
+                                    QString const& hisCall,
+                                    QString const& recordUtf8)
+  {
+    QString const base = Radio::base_callsign (hisCall).trimmed ().toUpper ();
+    if (base.isEmpty ())
+      {
+        return;
+      }
+    QString const qd =
+        extractField (recordUtf8, QStringLiteral ("QSO_DATE")).trimmed ();
+    QDate d;
+    if (qd.size () >= 8)
+      {
+        d = QDate::fromString (qd.left (8), QLatin1String ("yyyyMMdd"));
+      }
+    if (!d.isValid ())
+      {
+        d = QDate::currentDate ();
+      }
+    by_base[base].insert (d);
+  }
+
+  worked_before_load_bundle loader (QString const& path, AD1CCty const * prefixes)
+  {
+    worked_before_load_bundle bundle;
     QFile inputFile {path};
     if (inputFile.exists ())
       {
@@ -336,13 +392,15 @@ namespace
                     if (call.size ()) // require CALL field before we
                                       // will parse a record
                       {
+                        calendar_merge_qso_date_from_adif_fields (
+                          bundle.calendar_by_dx_base_upper, call, record);
                         auto const& entity = prefixes->lookup (call);
                         auto mode = extractField (record, "MODE").toUpper ();
                         if (!mode.size () || "MFSK" == mode)
                           {
                             mode = extractField (record, "SUBMODE").toUpper ();
                           }
-                        worked.emplace (call.toUpper ()
+                        bundle.worked.emplace (call.toUpper ()
                                         , extractField (record, "GRIDSQUARE").left (4).toUpper () // not interested in 6-digit grids
                                         , extractField (record, "BAND").toUpper ()
                                         , mode
@@ -359,7 +417,7 @@ namespace
             throw LoaderException (std::runtime_error {QCoreApplication::translate ("WorkedBefore", "Error opening ADIF log file for read: %0").arg (inputFile.errorString ()).toLocal8Bit ()});
           }
       }
-    return worked;
+    return bundle;
   }
 }
 
@@ -383,21 +441,24 @@ public:
   Configuration const * configuration_;
   QString path_;
   AD1CCty prefixes_;
-  QFutureWatcher<worked_before_database_type> loader_watcher_;
-  QFuture<worked_before_database_type> async_loader_;
+  QFutureWatcher<worked_before_load_bundle> loader_watcher_;
+  QFuture<worked_before_load_bundle> async_loader_;
   worked_before_database_type worked_;
+  QHash<QString, QSet<QDate>> calendar_by_dx_base_upper_;
 };
 
 WorkedBefore::WorkedBefore (Configuration const * configuration)
   : m_ {configuration}
 {
   Q_ASSERT (configuration);
-  connect (&m_->loader_watcher_, &QFutureWatcher<worked_before_database_type>::finished, [this] () {
+  connect (&m_->loader_watcher_, &QFutureWatcher<worked_before_load_bundle>::finished, [this] () {
       QString error;
       size_t n {0};
       try
         {
-          m_->worked_ = m_->loader_watcher_.result ();
+          worked_before_load_bundle bundle = m_->loader_watcher_.result ();
+          m_->worked_ = std::move (bundle.worked);
+          m_->calendar_by_dx_base_upper_ = std::move (bundle.calendar_by_dx_base_upper);
           n = m_->worked_.size ();
         }
       catch (LoaderException const& e)
@@ -483,6 +544,8 @@ bool WorkedBefore::add (QString const& call
         }
       m_->worked_.emplace (call.toUpper (), grid.left (4).toUpper (), band.toUpper (), mode.toUpper ()
                            , entity.entity_name, entity.continent, entity.CQ_zone, entity.ITU_zone);
+      calendar_merge_after_append (m_->calendar_by_dx_base_upper_, call
+                                   , QString::fromUtf8 (ADIF_record));
     }
   return true;
 }
@@ -707,4 +770,19 @@ bool WorkedBefore::ITU_zone_worked (int ITU_zone, QString const& mode, QString c
             != m_->worked_.get<ITU_zone_band> ().find (ITU_zone);
         }
     }
+}
+
+bool WorkedBefore::call_worked_on_local_calendar_day (QString const& dx_base_call_upper) const
+{
+  QString const k = dx_base_call_upper.trimmed ().toUpper ();
+  if (k.isEmpty ())
+    {
+      return false;
+    }
+  auto const i = m_->calendar_by_dx_base_upper_.constFind (k);
+  if (i == m_->calendar_by_dx_base_upper_.constEnd ())
+    {
+      return false;
+    }
+  return i->contains (QDate::currentDate ());
 }

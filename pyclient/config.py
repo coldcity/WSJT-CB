@@ -26,15 +26,13 @@ class DriverConfig:
     callsign: str = ""
     quiet_qso_bursts: int = 4
     wait_reply_bursts: int = 8
-    idle_answer_passes_call: int = 6
-    """Partner `*!` CQ ticks while TX queued before we `stoptx` and rebound (early answer hunt)."""
+    idle_answer_passes_call: int = 6  # ANSWERING_CQ: idle passes with no workable CQ → calling CQ mode.
     max_answer_cq_ignore_passes: int = 4
+    # ANSWERING_CQ: give up locked CQ station after N consecutive failing ``answer`` (OK never seen).
+    max_chase_answer_retries: int = 8
     quiet_wire_transcript: bool = False
-    verbose: bool = False
-    """Emit ``comment hold — …`` when we deliberately take no mode change."""
+    verbose: bool = False  # True → logging.DEBUG; otherwise INFO for --config driver runs.
     comment_holds: bool = True
-    logbook_csv: str | None = None
-    logbook_today_timezone: str = "local"
 
 
 def _as_bool(v: Any) -> bool:
@@ -54,14 +52,6 @@ def _opt_str(v: Any) -> str | None:
 
 def load_driver_config(path: Path) -> DriverConfig:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
-    log = data.get("logbook")
-    if isinstance(log, dict):
-        if "path" in log:
-            data.setdefault("logbook_csv", log["path"])
-        if "today_timezone" in log:
-            data.setdefault("logbook_today_timezone", log["today_timezone"])
-
-    tz = str(data.get("logbook_today_timezone", DriverConfig.logbook_today_timezone)).strip()
     cfg = DriverConfig(
         host=str(data.get("host", DriverConfig.host)),
         port=int(data.get("port", DriverConfig.port)),
@@ -78,11 +68,15 @@ def load_driver_config(path: Path) -> DriverConfig:
                 DriverConfig.max_answer_cq_ignore_passes,
             ),
         ),
+        max_chase_answer_retries=int(
+            data.get(
+                "max_chase_answer_retries",
+                DriverConfig.max_chase_answer_retries,
+            ),
+        ),
         quiet_wire_transcript=_as_bool(data.get("quiet_wire_transcript", False)),
         verbose=_as_bool(data.get("verbose", False)),
         comment_holds=_as_bool(data.get("comment_holds", DriverConfig.comment_holds)),
-        logbook_csv=_opt_str(data.get("logbook_csv")),
-        logbook_today_timezone=tz or "local",
     )
     if not cfg.callsign:
         raise ValueError("config: 'callsign' is required")

@@ -24,7 +24,7 @@ import argparse
 import asyncio
 import enum
 import logging
-import os
+import math
 import random
 import sys
 from datetime import date
@@ -36,7 +36,6 @@ _root_s = str(_root)
 if _root_s not in sys.path:
     sys.path.insert(0, _root_s)
 
-from pyclient.logbook import today_calendar_date, worked_station_ids_on_day
 from pyclient.protocol import (
     Burst,
     DecodeLine,
@@ -58,6 +57,9 @@ from pyclient.config import DriverConfig, load_driver_config, resolve_default_co
 
 
 log = logging.getLogger(__name__)
+
+# Softmax-ish bias when picking among CQ rows: ``exp((snr − best_snr) / τ)``. Lower τ = sharper peak on strongest.
+_CQ_SNR_WEIGHT_TEMP_DB: float = 10.0
 
 
 def _suppress_wire_echo_line(line: str) -> bool:
@@ -128,6 +130,32 @@ def _pick_best_cq_decode(rows: list[DecodeLine]) -> DecodeLine:
     return max(rows, key=_key)
 
 
+def _weighted_random_cq_pick(
+    cand: list[tuple[str, DecodeLine]],
+    *,
+    temperature_db: float = _CQ_SNR_WEIGHT_TEMP_DB,
+) -> tuple[str, DecodeLine]:
+    """Bias toward stronger (higher SNR) CQ decodes while still sampling stochastically."""
+    if len(cand) == 1:
+        return cand[0]
+
+    def snr_float(dc: DecodeLine) -> float:
+        return float(dc.snr) if dc.snr is not None else -30.0
+
+    snrs = [snr_float(dc) for _sta, dc in cand]
+    mx = max(snrs)
+    tau = max(temperature_db, 1e-6)
+    weights = [math.exp((s - mx) / tau) for s in snrs]
+    total = sum(weights)
+    r = random.random() * total
+    acc = 0.0
+    for i, w in enumerate(weights):
+        acc += w
+        if r <= acc:
+            return cand[i]
+    return cand[-1]
+
+
 def _glyph_at_star_to_us(d: DecodeLine) -> bool:
     """
     WSJT-X glyph band: '@' decoded as to us; '*' matched to Rx partner select.
@@ -185,9 +213,8 @@ class StationDriver:
         bursts_without_cq_reply: int = 8,
         idle_answer_passes_until_calling: int = 6,
         max_answer_cq_ignore_passes: int = 4,
+        max_chase_answer_retries: int = 8,
         echo_server_stdout: bool = True,
-        logbook_csv: Path | None = None,
-        logbook_today_timezone: str = "local",
         comment_holds: bool = True,
     ) -> None:
         self.session = session
@@ -219,6 +246,8 @@ class StationDriver:
         self.no_eligible_cq_burst_streak = 0
         self.idle_answer_passes_until_calling = idle_answer_passes_until_calling
         self.max_answer_cq_ignore_passes = max(1, max_answer_cq_ignore_passes)
+        self.max_chase_answer_retries = max(1, max_chase_answer_retries)
+        self._chase_answer_fail_streak = 0
 
         # After `answer` OK: stay ANSWERING_CQ until we see '@* to us' on a non-CQ decode.
         # While TX queued, partner *! CQ-only passes count toward max_answer_cq_ignore_passes (Wait-and-call style).
@@ -231,30 +260,29 @@ class StationDriver:
         # a TX QUEUED line at least once (first pass after `answer` often has none yet).
         self._answered_qso_saw_tx_queued: bool = False
 
-        self._logbook_path = logbook_csv
-        self._logbook_tz = (logbook_today_timezone or "local").strip()
-        self._logbook_cache: tuple[int, date, frozenset[str]] | None = None
+        # Server rejects `answer` when ADIF already has this DX on today's local date; cache skips for CQ picking.
+        self._answer_worked_skip_day: date | None = None
+        self._skipped_answer_worked_today_local: set[str] = set()
+
         self.comment_holds = comment_holds
         self._hold_sig_last: tuple[str, str] | None = None
 
-    def _worked_today_station_ids(self) -> frozenset[str]:
-        """Cached by log mtime + calendar day (for midnight / TZ rollovers)."""
-        if self._logbook_path is None:
-            return frozenset()
-        day = today_calendar_date(self._logbook_tz)
-        try:
-            mtime_ns = self._logbook_path.stat().st_mtime_ns
-        except OSError:
-            log.warning("logbook path not readable: %s", self._logbook_path)
-            return frozenset()
-        if self._logbook_cache is not None:
-            om, od, oid = self._logbook_cache
-            if om == mtime_ns and od == day:
-                return oid
-        ids = worked_station_ids_on_day(self._logbook_path, day)
-        self._logbook_cache = (mtime_ns, day, ids)
-        log.debug("logbook worked-today (%s): %d calls", day.isoformat(), len(ids))
-        return ids
+    def _ensure_answer_worked_skip_calendar(self) -> None:
+        today = date.today()
+        if self._answer_worked_skip_day != today:
+            self._skipped_answer_worked_today_local.clear()
+            self._answer_worked_skip_day = today
+
+    def skip_station_ids_for_cq_pick(
+        self, extra: frozenset[str] | None
+    ) -> frozenset[str] | None:
+        self._ensure_answer_worked_skip_calendar()
+        if not self._skipped_answer_worked_today_local and not extra:
+            return None
+        merged: set[str] = set(self._skipped_answer_worked_today_local)
+        if extra:
+            merged.update(extra)
+        return frozenset(merged)
 
     def srv_echo(self, line: str) -> None:
         """Mirror interesting server traffic on stdout (noise lines suppressed)."""
@@ -318,6 +346,29 @@ class StationDriver:
         self._answer_wait_at_star_before_in_qso = False
         self._answer_cq_ignore_passes = 0
 
+    def _clear_answer_chase_target(self) -> None:
+        """Drop SNR-lock CQ station (chase Hz) and ``answer`` fail streak."""
+        self.target_station_upper = None
+        self._target_last_cq_hz = None
+        self._chase_answer_fail_streak = 0
+
+    async def _register_failed_answer_attempt(self, key: str, explanation: str) -> bool:
+        """Count a bad ``answer`` while chasing a CQ; dice out like target-lost CQ if limit exceeded."""
+        self._chase_answer_fail_streak += 1
+        if self._chase_answer_fail_streak >= self.max_chase_answer_retries:
+            self._clear_answer_chase_target()
+            await self.comment_mode(
+                f"ANSWERING_CQ: {self.max_chase_answer_retries} consecutive failing "
+                "`answer` commands on same locked CQ — giving up; rolling dice for CQ mode",
+            )
+            if random.choice((True, False)):
+                await self.enter_calling_cq("dice exit answering (chase answer retry limit)")
+            else:
+                await self.comment_mode("dice: stay answering CQs (chase answer retry limit)")
+            return True
+        await self._comment_hold(key, explanation)
+        return False
+
     async def _confirm_answered_into_in_qso(self, b: Burst, note: str) -> None:
         if (b.tx_queued_text or "").strip():
             self._answered_qso_saw_tx_queued = True
@@ -326,8 +377,7 @@ class StationDriver:
         self.mode = StrategyMode.IN_QSO_ANSWERED
         self.quiet_bursts = 0
         self.no_eligible_cq_burst_streak = 0
-        self.target_station_upper = None
-        self._target_last_cq_hz = None
+        self._clear_answer_chase_target()
 
     async def stoptx(self) -> None:
         try:
@@ -364,8 +414,7 @@ class StationDriver:
         self._clear_answer_early_phase()
         self._qso_partner_upper = None
         self._answered_qso_saw_tx_queued = False
-        self.target_station_upper = None
-        self._target_last_cq_hz = None
+        self._clear_answer_chase_target()
         self.quiet_bursts = 0
         if was_called_side:
             self.mode = StrategyMode.CALLING_CQ
@@ -379,13 +428,13 @@ class StationDriver:
 
         self.mode = StrategyMode.ANSWERING_CQ
         self.no_eligible_cq_burst_streak = 0
-        ok = await self._engage_random_cq_from_burst(
+        ok, suppress = await self._engage_random_cq_from_burst(
             b,
             "after TX-queued visibility miss — pick CQ: {sta} @ {hz} Hz",
             exclude_station_ids=exclude_station_ids,
         )
-        if not ok:
-            log.info("TX-queued abort: no alternate CQ in same pass (logbook/filter/empty)")
+        if not ok and not suppress:
+            log.info("TX-queued abort: no alternate CQ in same pass (skipped/server/empty)")
             await self._comment_hold(
                 "abort_no_cq_same_pass",
                 "after visibility abort, no alternate CQ to answer in this decode pass — "
@@ -424,24 +473,27 @@ class StationDriver:
         picked_comment_fmt: str,
         *,
         exclude_station_ids: frozenset[str] | None = None,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         """
-        Comment + answer one CQ from this burst chosen at random.
-        Returns True when ``answer`` succeeded (strategy stays ANSWERING_CQ until @* establishes QSO mode).
+        Comment + answer one CQ from this burst, SNR-weighted random choice.
+
+        Returns ``(True, False)`` when ``answer`` returned ``OK:`` (early-hunt until @*).
+        Returns ``(False, True)`` when a station stays locked for chase (non-OK or exception),
+        including after the chase retry limit triggered its own dice/comment sequence (caller skips
+        generic "no CQ picked" holds).
+        Returns ``(False, False)`` when there is no eligible CQ row to try.
         """
-        merged: set[str] = set(self._worked_today_station_ids())
-        if exclude_station_ids:
-            merged.update(exclude_station_ids)
         cand = _eligible_cq_candidates(
             b.decodes,
             self.my_call_upper,
-            skip_station_ids=frozenset(merged) if merged else None,
+            skip_station_ids=self.skip_station_ids_for_cq_pick(exclude_station_ids),
         )
         if not cand:
-            return False
-        sta, dc = random.choice(cand)
+            return False, False
+        sta, dc = _weighted_random_cq_pick(cand)
         self.target_station_upper = sta
         self._target_last_cq_hz = None
+        self._chase_answer_fail_streak = 0
         await self.comment_mode(picked_comment_fmt.format(sta=sta, hz=dc.freq_hz))
         try:
             r = await self.command(f"answer {dc.freq_hz}")
@@ -450,19 +502,30 @@ class StationDriver:
                 self._answer_wait_at_star_before_in_qso = True
                 self._answer_cq_ignore_passes = 0
                 self.quiet_bursts = 0
-                self.target_station_upper = None
-                self._target_last_cq_hz = None
+                self._clear_answer_chase_target()
                 self.no_eligible_cq_burst_streak = 0
                 self._qso_partner_upper = chase_identity(sta).upper()
                 self._answered_qso_saw_tx_queued = False
                 log.debug("%s", r[:120])
-                return True
+                return True, False
+            if "already worked today" in r:
+                self._ensure_answer_worked_skip_calendar()
+                self._skipped_answer_worked_today_local.add(chase_identity(sta).upper())
+                log.info("answer rejected (already worked today): %s", sta)
+                return False, False
             log.warning("%s", r[:200])
+            await self._register_failed_answer_attempt(
+                "engage_answer_nok",
+                "locked CQ target: answer was not OK — retry or chase next decode pass",
+            )
+            return False, True
         except Exception as exc:  # noqa: BLE001
             log.warning("answer failed %s", exc)
-        self.target_station_upper = None
-        self._target_last_cq_hz = None
-        return False
+            await self._register_failed_answer_attempt(
+                "engage_answer_exc",
+                "locked CQ target: answer command failed — retry or chase next decode pass",
+            )
+            return False, True
 
     async def _recover_from_partner_snub(self, b) -> None:
         exclude: set[str] = set()
@@ -480,17 +543,16 @@ class StationDriver:
         await self.stoptx()
         self._clear_answer_early_phase()
         self.mode = StrategyMode.ANSWERING_CQ
-        self.target_station_upper = None
-        self._target_last_cq_hz = None
+        self._clear_answer_chase_target()
         self.quiet_bursts = 0
         self._qso_partner_upper = None
         self._answered_qso_saw_tx_queued = False
-        ok = await self._engage_random_cq_from_burst(
+        ok, suppress = await self._engage_random_cq_from_burst(
             b,
             "race lost — rebound answer {sta} @ {hz} Hz",
             exclude_station_ids=frozenset(exclude),
         )
-        if not ok:
+        if not ok and not suppress:
             log.info("Snub rebound: no eligible CQ in same pass")
             await self._comment_hold(
                 "snub_no_cq_same_pass",
@@ -503,11 +565,11 @@ class StationDriver:
             return
         if self._answer_wait_at_star_before_in_qso:
             return
-        wt = self._worked_today_station_ids()
+        wt = self.skip_station_ids_for_cq_pick(None)
         cand = _eligible_cq_candidates(
             b.decodes,
             self.my_call_upper,
-            skip_station_ids=wt if wt else None,
+            skip_station_ids=wt,
         )
         if cand:
             self.no_eligible_cq_burst_streak = 0
@@ -518,15 +580,23 @@ class StationDriver:
                 f"ans_idle_{self.no_eligible_cq_burst_streak}",
                 "no workable CQ rows this pass — "
                 f"{self.no_eligible_cq_burst_streak}/"
-                f"{self.idle_answer_passes_until_calling} toward CQ mode "
-                "(worked/filter or empty CQ list)",
+                f"{self.idle_answer_passes_until_calling} toward CQ mode (dice at threshold) "
+                "(skip cache or empty CQ list)",
             )
         elif self.no_eligible_cq_burst_streak >= self.idle_answer_passes_until_calling:
             await self.comment_mode(
                 f"{self.idle_answer_passes_until_calling} consecutive decode passes "
-                "with no eligible CQ decodes → CQ mode",
+                "with no eligible CQ decodes — rolling dice for CQ mode vs stay answering",
             )
-            await self.enter_calling_cq("idle answer band — no workable CQ repetitions")
+            if random.choice((True, False)):
+                await self.enter_calling_cq(
+                    "dice exit answering (idle band — no workable CQ repetitions)",
+                )
+            else:
+                self.no_eligible_cq_burst_streak = 0
+                await self.comment_mode(
+                    "dice: stay answering CQs (idle streak threshold rolled stay)",
+                )
 
     async def handle_burst(self, b: Burst) -> None:
         parity = b.tx_slot
@@ -609,22 +679,21 @@ class StationDriver:
                             await self.stoptx()
                             self._clear_answer_early_phase()
                             self._qso_partner_upper = None
-                            self.target_station_upper = None
-                            self._target_last_cq_hz = None
+                            self._clear_answer_chase_target()
                             self._answered_qso_saw_tx_queued = False
                             self.quiet_bursts = 0
-                            ok = await self._engage_random_cq_from_burst(
+                            ok, suppress = await self._engage_random_cq_from_burst(
                                 b,
                                 "after CQ-ignore limit — pick CQ: {sta} @ {hz} Hz",
                             )
-                            if not ok:
+                            if not ok and not suppress:
                                 await self._comment_hold(
                                     "ignore_limit_no_cq",
                                     "CQ-ignore abort: no alternate CQ immediately — listening",
                                 )
                             return
                         await self.comment_mode(
-                            f"Retry ({n}/{mx}): DX still CQ on select (*! glyph) "
+                            f"Retry ({n+1}/{mx}): DX still CQ on select (*! glyph) "
                             "without @* to us yet — tolerate while AutoSeq progresses",
                         )
                         return
@@ -639,8 +708,7 @@ class StationDriver:
                     self.mode = StrategyMode.IN_QSO_ANSWERED
                     self.quiet_bursts = 0
                     self.no_eligible_cq_burst_streak = 0
-                    self.target_station_upper = None
-                    self._target_last_cq_hz = None
+                    self._clear_answer_chase_target()
                     self._qso_partner_upper = None
                     self._answered_qso_saw_tx_queued = False
                     return
@@ -669,30 +737,41 @@ class StationDriver:
                                 self._answer_cq_ignore_passes = 0
                                 self.quiet_bursts = 0
                                 self.no_eligible_cq_burst_streak = 0
-                                self.target_station_upper = None
-                                self._target_last_cq_hz = None
+                                self._clear_answer_chase_target()
                                 self._qso_partner_upper = (
                                     chase_identity(chase_partner).upper() if chase_partner else None
                                 )
                                 self._answered_qso_saw_tx_queued = False
                                 log.debug("%s", r[:120])
                                 return
+                            if "already worked today" in r:
+                                self._ensure_answer_worked_skip_calendar()
+                                if self.target_station_upper:
+                                    self._skipped_answer_worked_today_local.add(
+                                        chase_identity(self.target_station_upper).upper()
+                                    )
+                                    log.info(
+                                        "answer rejected (already worked today): %s",
+                                        self.target_station_upper,
+                                    )
+                                return
                             log.warning("%s", r[:200])
-                            await self._comment_hold(
+                            if await self._register_failed_answer_attempt(
                                 "chase_answer_nok",
                                 "ANSWERING_CQ: target still CQ but answer was not OK — "
                                 "same mode, retry next pass",
-                            )
+                            ):
+                                return
                         except Exception as exc:  # noqa: BLE001
                             log.warning("answer failed %s", exc)
-                            await self._comment_hold(
+                            if await self._register_failed_answer_attempt(
                                 "chase_answer_exc",
                                 "ANSWERING_CQ: answer command failed — same mode, retry next pass",
-                            )
+                            ):
+                                return
                         return
                     else:
-                        self.target_station_upper = None
-                        self._target_last_cq_hz = None
+                        self._clear_answer_chase_target()
                         await self.comment_mode(
                             "target no longer CQ; cleared target — rolling dice for CQ mode",
                         )
@@ -702,14 +781,14 @@ class StationDriver:
                             await self.comment_mode("dice: stay answering CQs (target quit CQ)")
                         return
                 else:
-                    ok_pick = await self._engage_random_cq_from_burst(
+                    ok_pick, suppress_pick = await self._engage_random_cq_from_burst(
                         b,
                         "picked CQ from {sta} @ {hz} Hz (new target)",
                     )
-                    if not ok_pick:
+                    if not ok_pick and not suppress_pick:
                         await self._comment_hold(
                             "ans_no_pick",
-                            "ANSWERING_CQ: no logbook-eligible CQ to answer this pass — "
+                            "ANSWERING_CQ: no eligible CQ to answer this pass — "
                             "stay in answer mode for next decode",
                         )
                     return
@@ -844,8 +923,7 @@ class StationDriver:
         await self.stoptx()
         await self.comment_mode(reason)
         self.mode = StrategyMode.CALLING_CQ
-        self.target_station_upper = None
-        self._target_last_cq_hz = None
+        self._clear_answer_chase_target()
         self._qso_partner_upper = None
         self._answered_qso_saw_tx_queued = False
         self.cq_phase = CQPhase.FIND_SLOT
@@ -861,8 +939,7 @@ class StationDriver:
         await self.stoptx()
         await self.comment_mode(reason)
         self.mode = StrategyMode.ANSWERING_CQ
-        self.target_station_upper = None
-        self._target_last_cq_hz = None
+        self._clear_answer_chase_target()
         self._qso_partner_upper = None
         self._answered_qso_saw_tx_queued = False
         self.cq_phase = CQPhase.FIND_SLOT
@@ -906,20 +983,19 @@ class StationDriver:
 
         await self.stoptx()
         self.mode = StrategyMode.ANSWERING_CQ
-        self.target_station_upper = None
-        self._target_last_cq_hz = None
+        self._clear_answer_chase_target()
         self._qso_partner_upper = None
         self._answered_qso_saw_tx_queued = False
         self._clear_answer_early_phase()
         self.quiet_bursts = 0
         self.no_eligible_cq_burst_streak = 0
 
-        ok = await self._engage_random_cq_from_burst(
+        ok, suppress = await self._engage_random_cq_from_burst(
             b,
             "immediate pick after answered QSO exit: {sta} @ {hz} Hz",
         )
-        if not ok:
-            log.info("answered-QSO exit: no eligible CQ (logbook filter or empty band)")
+        if not ok and not suppress:
+            log.info("answered-QSO exit: no eligible CQ (skip cache or empty band)")
             await self._comment_hold(
                 "ans_idle_exit_no_cq",
                 "answered-QSO finished but no CQ to pick immediately — stay ANSWERING_CQ "
@@ -937,15 +1013,14 @@ class StationDriver:
         self._clear_answer_early_phase()
         self._qso_partner_upper = None
         self._answered_qso_saw_tx_queued = False
-        self.target_station_upper = None
-        self._target_last_cq_hz = None
+        self._clear_answer_chase_target()
         self.quiet_bursts = 0
         self.no_eligible_cq_burst_streak = 0
-        ok = await self._engage_random_cq_from_burst(
+        ok, suppress = await self._engage_random_cq_from_burst(
             b,
             "after early hunt idle — pick CQ: {sta} @ {hz} Hz",
         )
-        if not ok:
+        if not ok and not suppress:
             log.info("early hunt idle: no CQ pick")
 
     async def maybe_finish_qso_burst(self, b: Burst) -> None:
@@ -960,6 +1035,7 @@ class StationDriver:
                 await self.comment_mode(f"quiet {self.quiet_bursts} bursts — resume calling CQ cycle")
                 self.mode = StrategyMode.CALLING_CQ
                 self.quiet_bursts = 0
+                self._clear_answer_chase_target()
                 self._qso_partner_upper = None
                 self.cq_phase = CQPhase.FIND_SLOT
                 self.chosen_cq_freq = None
@@ -1024,13 +1100,6 @@ async def run_driver(cfg: DriverConfig) -> None:
     def transcript_out(line: str) -> None:
         print(f"> {line}", flush=True)
 
-    raw_lb = (cfg.logbook_csv or "").strip()
-    logbook_path = (
-        Path(os.path.expandvars(raw_lb)).expanduser().resolve()
-        if raw_lb
-        else None
-    )
-
     session = await open_session(
         cfg.host,
         cfg.port,
@@ -1055,9 +1124,8 @@ async def run_driver(cfg: DriverConfig) -> None:
         bursts_without_cq_reply=cfg.wait_reply_bursts,
         idle_answer_passes_until_calling=cfg.idle_answer_passes_call,
         max_answer_cq_ignore_passes=cfg.max_answer_cq_ignore_passes,
+        max_chase_answer_retries=cfg.max_chase_answer_retries,
         echo_server_stdout=not cfg.quiet_wire_transcript,
-        logbook_csv=logbook_path,
-        logbook_today_timezone=cfg.logbook_today_timezone,
         comment_holds=cfg.comment_holds,
     )
 

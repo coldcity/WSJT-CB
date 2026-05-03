@@ -759,6 +759,16 @@ void TcpCliServer::processLine(QString const& line)
             QString mode = p[4];
             QString msg  = p.size() > 5 ? p.mid(5).join(' ') : QString{};
 
+            if (m_answerWorkedTodayPred
+                && !m_selectedDxBaseUpper.isEmpty ()
+                && m_answerWorkedTodayPred (m_selectedDxBaseUpper))
+            {
+                sendLine (QStringLiteral (
+                    "ERR: already worked today (same DX in ADIF log; local calendar date)"));
+                sendPrompt ();
+                return;
+            }
+
             emit replySignal(t, snr, dt, freq, mode, msg, false, 0);
             sendLine (
                 QStringLiteral ("OK: answering %1")
@@ -1155,6 +1165,12 @@ void TcpCliServer::setSpotsReceiverCountryFormatter (
     m_spotsRcvrCountryFmt = std::move (formatter);
 }
 
+void TcpCliServer::setAnswerWorkedTodayRejector (
+    std::function<bool (QString const&)> pred)
+{
+    m_answerWorkedTodayPred = std::move (pred);
+}
+
 void TcpCliServer::onTxFirstChanged(bool txFirst)
 {
     m_txFirst = txFirst;
@@ -1508,7 +1524,7 @@ void TcpCliServer::printHelp()
     sendLine(cliHelpLine(QStringLiteral("comment <text>"), QStringLiteral("n"), QStringLiteral("n <text>  -  note to operator (log + CLI Log window)")));
     sendLine(cliHelpLine(QStringLiteral("select <Hz>"), QStringLiteral("f"), QStringLiteral("f <Hz>  -  Tx+Rx audio offset")));
     sendLine(cliHelpLine(QStringLiteral("cq [<Hz>]"), QStringLiteral("c"), QStringLiteral("CQ; c <Hz> selects that freq, then CQ")));
-    sendLine(cliHelpLine(QStringLiteral("answer [<Hz>]"), QStringLiteral("a"), QStringLiteral("Answer; a <Hz> selects, then answer")));
+    sendLine(cliHelpLine(QStringLiteral("answer [<Hz>]"), QStringLiteral("a"), QStringLiteral("Answer; rejects if ADIF shows QSO with this DX on today's local date")));
     sendLine(cliHelpLine(QStringLiteral("help"), QStringLiteral("h"), QStringLiteral("This help text")));
     sendLine(cliHelpLine(QStringLiteral("spots [<n>]"), QStringLiteral("-"), QStringLiteral("PSK Reporter Tx (pskreporter.info); default 20; auto ≤10 / 5 min (reset by manual spots)")));
     sendLine(cliHelpLine(QStringLiteral("bye"), QStringLiteral("b"), QStringLiteral("Close connection; quit and exit are aliases")));

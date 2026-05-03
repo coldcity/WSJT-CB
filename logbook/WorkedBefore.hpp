@@ -38,6 +38,9 @@ public:
   bool ITU_zone_worked (int ITU_zone, QString const& mode, QString const& band) const;
   QString cty_version () const;
 
+  /** DX base call trimmed upper (\c Radio::base_callsign style). Uses \c QDate::currentDate () (local calendar). */
+  bool call_worked_on_local_calendar_day (QString const& dx_base_call_upper) const;
+
   Q_SIGNAL void finished_loading (int worked_before_record_count, QString const, QString const& error) const;
 
 private:
