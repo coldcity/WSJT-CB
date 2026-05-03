@@ -1,0 +1,28 @@
+# Copy to wsjt-driver.toml beside this file or your working directory, then edit.
+
+host = "127.0.0.1"
+port = 7374
+# password = ""            # omit or leave empty when server has no --cli-pass
+callsign = "MYCALL"
+
+# After we answered someone's CQ, exit IN_QSO_ANSWERED when there is no TX QUEUED line
+# or when our partner shows *! CQ again. (Does not affect IN_QSO_CALLED quiet timeout.)
+quiet_qso_bursts = 4
+
+wait_reply_bursts = 8
+idle_answer_passes_call = 6
+# Partner still showing *! CQ (not @* directed at us) while TX queued: count passes; at limit, stoptx + hunt.
+max_answer_cq_ignore_passes = 4
+
+quiet_wire_transcript = false
+verbose = false
+# Operator ``comment`` lines explaining why we are not changing strategy (deduped per mode).
+comment_holds = true
+
+[logbook]
+# WSJT-CB QSO log (CSV-style rows). Paths may use %LOCALAPPDATA% on Windows.
+# Subfolder name is install-specific; adjust to match your …\AppData\Local\… tree.
+path = "%LOCALAPPDATA%/WSJT-CB by 1AT106 - 1XZ732 - 161XZ085/wsjtcb.log"
+
+# Today boundary: "local", "UTC", or an IANA name e.g. "Europe/London".
+today_timezone = "local"

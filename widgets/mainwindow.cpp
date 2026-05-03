@@ -26,6 +26,7 @@
 #include <QFile>
 #include <QDialog>
 #include <QVBoxLayout>
+#include <QHBoxLayout>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QFontDatabase>
@@ -37,6 +38,7 @@
 #include <QScrollBar>
 #include <QTextBlock>
 #include <QProgressBar>
+#include <QCheckBox>
 #include <QLineEdit>
 #include <QRegExpValidator>
 #include <QRegExp>
@@ -1493,6 +1495,8 @@ void MainWindow::writeSettings()
   m_settings->setValue("SerialNumber",ui->sbSerialNumber->value ());
   m_settings->setValue("FoxTextMsg", m_freeTextMsg0);
   m_settings->setValue("WorkDupes", ui->cbWorkDupes->isChecked());
+  m_settings->setValue("CliLogShowTimestamps", m_cliLogTimestampsShown);
+  m_settings->setValue("CliLogInjectAsCliCommand", m_cliLogInjectAsCliCommand);
   m_settings->endGroup();
 
   // do this in the General group because we save the parameters from various places
@@ -1724,6 +1728,10 @@ void MainWindow::readSettings()
   bool displayQSYMessageCreator = m_settings->value ("QSYMessageCreatorDisplayed", false).toBool ();
   bool displayQSYMonitor = m_settings->value("QSYMonitorDisplayed", false).toBool ();
   bool enableQSYpopups = m_settings->value("ShowQSYMessages", true).toBool ();
+  m_cliLogTimestampsShown =
+      m_settings->value ("CliLogShowTimestamps", true).toBool ();
+  m_cliLogInjectAsCliCommand =
+      m_settings->value ("CliLogInjectAsCliCommand", false).toBool ();
   ui->respondComboBox->setCurrentIndex(m_settings->value("RespondCQ",0).toInt());
   ui->comboBoxHoundSort->setCurrentIndex(m_settings->value("HoundSort",3).toInt());
   ui->sbNlist->setValue(m_settings->value("FoxNlist",12).toInt());
@@ -4712,63 +4720,227 @@ void MainWindow::on_actionWide_Waterfall_triggered()      //Display Waterfalls
   m_wideGraph->showNormal();
 }
 
+void MainWindow::syncCliServerSnapshot ()
+{
+  if (!m_cliServer) return;
+  m_cliServer->setStationSnapshot (
+    m_config.my_callsign (), m_config.my_grid (), m_freqNominal);
+}
+
 void MainWindow::updateCliLogDialogStyle ()
 {
   if (!m_cliLogEdit) return;
   if (m_cliLogEdit->objectName ().isEmpty ())
     m_cliLogEdit->setObjectName (QStringLiteral ("cliSessionLogView"));
-  // Use the same toggle as "Use dark style" — not palette lightness (unreliable) and not
-  // m_useDarkStyle alone (qApp/qdarkstyle can be out of sync with the action).
-  bool const is_dark = ui->actionUse_Dark_Style->isChecked ();
-  QFont f;
-#if defined (_WIN32)
-  f = QFont (QStringLiteral ("Consolas"));
-#else
-  f = QFontDatabase::systemFont (QFontDatabase::FixedFont);
-  f.setStyleHint (QFont::Monospace, QFont::PreferDefault);
-  f.setFixedPitch (true);
-#endif
-  if (is_dark) {
-    // qdarkstyle applies QPlainTextEdit { ... } on the app; per-widget QSS wins over QPalette.
-    constexpr int kDarkCliLogPt = 26;
-    f.setPointSize (kDarkCliLogPt);
-    m_cliLogEdit->setFont (f);
-    m_cliLogEdit->setStyleSheet (QStringLiteral (
-        "QPlainTextEdit#cliSessionLogView {"
-        "  background-color: #000000;"
-        "  color: #33ff99;"
-        "  selection-background-color: #004d33;"
-        "  selection-color: #eeffee;"
-        "  border: 1px solid #3d4d4d;"
-        "}"));
-    if (m_cliLogDialog) {
-      m_cliLogDialog->setStyleSheet (QStringLiteral (
-          "QDialog { background-color: #000000; }"
-          "QPushButton { background-color: #2a2a2a; color: #99ffcc; min-width: 7em; padding: 6px; }"));
+
+  QWidget *const vp = m_cliLogEdit->viewport ();
+  if (vp != nullptr && vp->objectName ().isEmpty ())
+    vp->setObjectName (QStringLiteral ("cliSessionLogViewport"));
+
+  // Dark style is qApp->setStyleSheet(qdarkstyle + "* { font ... }"). Unused properties
+  // cascade from QPlainTextEdit { color: #F0F0F0; ... } / * — we must set font, color,
+  // and background on #cliSessionLogView (and viewport) or they stay theme defaults.
+  constexpr int kCliLogPt = 14;
+  QFontDatabase const db;
+  QString fam = QStringLiteral ("Courier New");
+  if (!db.hasFamily (fam))
+    {
+      fam = QStringLiteral ("Courier");
+      if (!db.hasFamily (fam))
+        fam.clear ();
     }
-  } else {
-    qreal const base = m_config.text_font ().pointSizeF ();
-    if (base > 0.0) f.setPointSizeF (std::max (16.0, base + 4.0));
-    else f.setPointSize (18);
-    m_cliLogEdit->setFont (f);
-    m_cliLogEdit->setStyleSheet (QStringLiteral (
-        "QPlainTextEdit#cliSessionLogView {"
-        "  background-color: #ffffff;"
-        "  color: #000000;"
-        "  selection-background-color: #2f80c1;"
-        "  selection-color: #ffffff;"
-        "  border: 1px solid #b0b0b0;"
-        "}"));
-    if (m_cliLogDialog) m_cliLogDialog->setStyleSheet (QString {});
-  }
+  QFont f;
+  if (fam.isEmpty ())
+    f = QFontDatabase::systemFont (QFontDatabase::FixedFont);
+  else
+    {
+      f.setFamily (fam);
+      f.setStyleHint (QFont::TypeWriter, QFont::PreferAntialias);
+      f.setFixedPitch (true);
+    }
+  f.setPointSize (kCliLogPt);
+
+  bool const is_dark = ui->actionUse_Dark_Style->isChecked ();
+  QString const familyList =
+      fam.isEmpty () ? QStringLiteral ("monospace")
+                     : (QLatin1Char ('\'') + fam
+                        + QStringLiteral ("\', Courier, monospace"));
+  QString const pt = QString::number (kCliLogPt);
+  QString fore;
+  QString back;
+  QString selText;
+  QString selBack;
+  QString border;
+  QString borderHi;
+  if (is_dark)
+    {
+      fore = QStringLiteral ("#33ff99");
+      back = QStringLiteral ("#000000");
+      selText = QStringLiteral ("#eeffee");
+      selBack = QStringLiteral ("#004d33");
+      border = QStringLiteral ("#3d4d4d");
+      borderHi = QStringLiteral ("#556666");
+      if (m_cliLogDialog)
+        {
+          m_cliLogDialog->setStyleSheet (
+              QStringLiteral (
+                  "QDialog { background-color: #000000; }"
+                  "QCheckBox { color: #99ffcc; spacing: 8px; }"
+                  "QCheckBox::indicator { width: 16px; height: 16px; }"
+                  "QPushButton { background-color: #2a2a2a; color: #99ffcc; "
+                  " min-width: 7em; padding: 6px; }"));
+        }
+    }
+  else
+    {
+      fore = QStringLiteral ("#101010");
+      back = QStringLiteral ("#ffffff");
+      selText = QStringLiteral ("#ffffff");
+      selBack = QStringLiteral ("#2f80c1");
+      border = QStringLiteral ("#c0c0c0");
+      borderHi = QStringLiteral ("#909090");
+      if (m_cliLogDialog)
+        {
+          // Light palette: explicitly set checkbox text on QDialog parents that use
+          // a custom page background elsewhere (themes can leave unchecked labels
+          // low-contrast here).
+          m_cliLogDialog->setStyleSheet (
+              QStringLiteral ("QCheckBox { color: #101010; }"));
+        }
+    }
+
+  QString const logQss =
+      QStringLiteral ("QPlainTextEdit#cliSessionLogView {"
+                    " font-family: %1;"
+                    " font-size: %2pt;"
+                    " font-weight: normal;"
+                    " font-style: normal;"
+                    " color: %3;"
+                    " background-color: %4;"
+                    " selection-color: %5;"
+                    " selection-background-color: %6;"
+                    " border: 2px solid %7;"
+                    " border-radius: 2px;"
+                    " padding: 2px;"
+                    " }"
+                    "QPlainTextEdit#cliSessionLogView:hover,"
+                    "QPlainTextEdit#cliSessionLogView:focus {"
+                    " color: %3;"
+                    " background-color: %4;"
+                    " border: 2px solid %8;"
+                    " }"
+                    "QWidget#cliSessionLogViewport {"
+                    " font-family: %1;"
+                    " font-size: %2pt;"
+                    " color: %3;"
+                    " background-color: %4;"
+                    " selection-color: %5;"
+                    " selection-background-color: %6;"
+                    " }")
+          .arg (familyList)
+          .arg (pt)
+          .arg (fore)
+          .arg (back)
+          .arg (selText)
+          .arg (selBack)
+          .arg (border)
+          .arg (borderHi);
+
+  m_cliLogEdit->setStyleSheet (logQss);
+  m_cliLogEdit->setFont (f);
+  m_cliLogEdit->document ()->setDefaultFont (f);
+  if (vp != nullptr)
+    vp->setFont (f);
+
+  if (m_cliOperatorInput != nullptr)
+    {
+      if (m_cliOperatorInput->objectName ().isEmpty ())
+        {
+          m_cliOperatorInput->setObjectName (
+              QStringLiteral ("cliOperatorLine"));
+        }
+      QString const opQss =
+          QStringLiteral ("QLineEdit#cliOperatorLine {"
+                          " font-family: %1;"
+                          " font-size: %2pt;"
+                          " font-weight: normal;"
+                          " color: %3;"
+                          " background-color: %4;"
+                          " border: 2px solid %5;"
+                          " padding: 2px;"
+                          " border-radius: 2px;"
+                          " }"
+                          "QLineEdit#cliOperatorLine:focus {"
+                          " border: 2px solid %6;"
+                          " }")
+              .arg (familyList)
+              .arg (pt)
+              .arg (fore)
+              .arg (back)
+              .arg (border)
+              .arg (borderHi);
+      m_cliOperatorInput->setStyleSheet (opQss);
+      m_cliOperatorInput->setFont (f);
+    }
+}
+
+namespace
+{
+bool cliLogLineIsOutboundBareNewlineMarker (QString const& lineRaw)
+{
+  QString line = lineRaw;
+  if (line.endsWith (QLatin1Char ('\r')))
+    line.chop (1);
+
+  QString tail = line;
+  static QRegularExpression const tsPrefix (QStringLiteral(
+      R"(^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\s+)"));
+  QRegularExpressionMatch const m = tsPrefix.match (line);
+  if (m.hasMatch ())
+    tail = line.mid (m.capturedLength (0));
+
+  // File / signal format: "... OUT \\n" (two-char payload: backslash + n)
+  QString const bareNlMarker =
+      QLatin1String ("OUT ")
+      + (QString (QChar (QLatin1Char ('\\'))) + QLatin1Char ('n'));
+  return tail == bareNlMarker;
+}
+
+QString formatStoredCliLineForDisplay (QString const& line, bool showTimestamps)
+{
+  if (showTimestamps) return line;
+  static QRegularExpression const re (QStringLiteral(
+      R"(^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\s+)"));
+  QRegularExpressionMatch const m = re.match (line);
+  return m.hasMatch () ? line.mid (m.capturedLength (0)) : line;
+}
 }
 
 void MainWindow::loadCliLogFromFile ()
 {
   if (!m_cliLogEdit || !m_cliServer) return;
   QFile f (m_cliServer->cliLogFilePath ());
+  QString text;
   if (f.open (QIODevice::ReadOnly))
-    m_cliLogEdit->setPlainText (QString::fromUtf8 (f.readAll ()));
+    text = QString::fromUtf8 (f.readAll ());
+  else
+    text.clear ();
+
+  if (!text.isEmpty ())
+    {
+      QStringList const lines =
+          text.split (QLatin1Char ('\n'), Qt::KeepEmptyParts);
+      QStringList shown;
+      shown.reserve (lines.size ());
+      for (QString const& ln : lines)
+        {
+          if (cliLogLineIsOutboundBareNewlineMarker (ln))
+            continue;
+          shown.push_back (
+              formatStoredCliLineForDisplay (ln, m_cliLogTimestampsShown));
+        }
+      m_cliLogEdit->setPlainText (shown.join (QLatin1Char ('\n')));
+    }
   else
     m_cliLogEdit->clear ();
   QTextCursor tc = m_cliLogEdit->textCursor ();
@@ -4782,9 +4954,13 @@ void MainWindow::loadCliLogFromFile ()
 void MainWindow::onCliLogLineAppended (QString const& line)
 {
   if (!m_cliLogEdit) return;
+  if (cliLogLineIsOutboundBareNewlineMarker (line))
+    return;
+  QString const insertLine =
+      formatStoredCliLineForDisplay (line, m_cliLogTimestampsShown);
   QTextCursor c = m_cliLogEdit->textCursor ();
   c.movePosition (QTextCursor::End);
-  c.insertText (line + QLatin1Char ('\n'));
+  c.insertText (insertLine + QLatin1Char ('\n'));
   m_cliLogEdit->setTextCursor (c);
   m_cliLogEdit->ensureCursorVisible ();
 }
@@ -4800,16 +4976,130 @@ void MainWindow::on_actionCLI_Log_triggered ()
       m_cliLogEdit = new QPlainTextEdit (m_cliLogDialog);
       m_cliLogEdit->setReadOnly (true);
       m_cliLogEdit->setLineWrapMode (QPlainTextEdit::NoWrap);
-      updateCliLogDialogStyle ();
-      vbox->addWidget (m_cliLogEdit);
+      vbox->addWidget (m_cliLogEdit, 1);
+      m_cliOperatorInput = new QLineEdit (m_cliLogDialog);
+      m_cliOperatorInput->setPlaceholderText (
+          m_cliLogInjectAsCliCommand
+              ? tr ("CLI command — Enter / Send: IN + echoed + executed")
+              : tr ("Operator note — Send as OUT [OPERATOR]; Idle client sees it"));
+      m_cliLogShowTimestampsCheck =
+          new QCheckBox (tr ("Show timestamps"), m_cliLogDialog);
+      m_cliLogShowTimestampsCheck->setChecked (m_cliLogTimestampsShown);
+      connect (m_cliLogShowTimestampsCheck, &QCheckBox::stateChanged, this,
+               [this] (int state)
+               {
+                 m_cliLogTimestampsShown = (state == Qt::Checked);
+                 m_settings->beginGroup ("MainWindow");
+                 m_settings->setValue ("CliLogShowTimestamps",
+                                         m_cliLogTimestampsShown);
+                 m_settings->endGroup ();
+                 loadCliLogFromFile ();
+               });
+      m_cliLogSendAsCliCommandCheck =
+          new QCheckBox (tr ("Send as command"), m_cliLogDialog);
+      m_cliLogSendAsCliCommandCheck->setChecked (m_cliLogInjectAsCliCommand);
+      m_cliLogSendAsCliCommandCheck->setToolTip (
+          tr ("When checked, Send logs the line as IN, echoes it on the CLI session, "
+              "and runs it as a CLI command (Idle client required). Unchecked sends an "
+              "OUT operator note only."));
+      connect (m_cliLogSendAsCliCommandCheck, &QCheckBox::stateChanged, this,
+               [this] (int state)
+               {
+                 m_cliLogInjectAsCliCommand = (state == Qt::Checked);
+                 m_settings->beginGroup ("MainWindow");
+                 m_settings->setValue ("CliLogInjectAsCliCommand",
+                                         m_cliLogInjectAsCliCommand);
+                 m_settings->endGroup ();
+                 if (m_cliOperatorInput != nullptr)
+                   m_cliOperatorInput->setPlaceholderText (
+                       (state == Qt::Checked)
+                           ? tr ("CLI command — Enter / Send: IN + echoed + executed")
+                           : tr ("Operator note — Send as OUT [OPERATOR]; Idle client sees "
+                                 "it"));
+               });
+      auto* injectRow = new QHBoxLayout;
+      auto* injectBtn = new QPushButton (tr ("Send"));
+      injectRow->addWidget (m_cliOperatorInput, 1);
+      injectRow->addWidget (injectBtn);
+      vbox->addLayout (injectRow);
+      auto* bottomRow = new QHBoxLayout;
+      bottomRow->addWidget (m_cliLogShowTimestampsCheck);
+      bottomRow->addSpacing (16);
+      bottomRow->addWidget (m_cliLogSendAsCliCommandCheck);
+      bottomRow->addStretch ();
+      auto* kickBtn   = new QPushButton (tr ("Kick"));
+      kickBtn->setToolTip (
+          tr ("Disconnect the connected CLI client (same as the client typing bye)"));
       auto* closeBtn = new QPushButton (tr ("Close"));
       connect (closeBtn, &QPushButton::clicked, m_cliLogDialog, &QWidget::close);
-      vbox->addWidget (closeBtn);
+      bottomRow->addWidget (kickBtn);
+      bottomRow->addSpacing (8);
+      bottomRow->addWidget (closeBtn);
+      vbox->addLayout (bottomRow);
+      auto doInject = [this] ()
+        {
+          if (!m_cliServer || !m_cliOperatorInput) return;
+          QString const t = m_cliOperatorInput->text ();
+          if (t.trimmed ().isEmpty ()) return;
+          bool const asCmd =
+              m_cliLogSendAsCliCommandCheck != nullptr
+              && m_cliLogSendAsCliCommandCheck->isChecked ();
+          bool ok                                 = false;
+          if (asCmd)
+            ok = m_cliServer->injectOperatorLineAsCliCommand (t);
+          else
+            {
+              m_cliServer->injectOperatorMessage (t);
+              ok = true;
+            }
+          if (!ok)
+            MessageBox::information_message (
+                m_cliLogDialog, tr ("Send as CLI command"),
+                tr ("Cannot run as CLI command — the TCP client must be connected and "
+                    "authenticated (past the first-line password if used)."));
+          else m_cliOperatorInput->clear ();
+        };
+      connect (injectBtn, &QPushButton::clicked, this, doInject);
+      connect (m_cliOperatorInput, &QLineEdit::returnPressed, this, doInject);
+      connect (kickBtn, &QPushButton::clicked, this,
+               [this] ()
+                 {
+                   if (!m_cliServer || !m_cliLogDialog) return;
+                   if (MessageBox::query_message (
+                           m_cliLogDialog, tr ("Kick CLI client"),
+                           tr ("Disconnect the connected TCP CLI client? "
+                               "It will receive BYE and the link will close."),
+                           QString {}, MessageBox::Yes | MessageBox::No,
+                           MessageBox::No)
+                       != MessageBox::Yes)
+                     return;
+                   if (!m_cliServer->kickClient ())
+                     MessageBox::information_message (
+                         m_cliLogDialog, tr ("Kick CLI client"),
+                         tr ("No CLI client is connected."));
+                 });
+      updateCliLogDialogStyle ();
       m_cliLogDialog->resize (1080, 640);
       loadCliLogFromFile ();
     }
   else if (!m_cliLogDialog->isVisible ())
-    loadCliLogFromFile ();
+    {
+      updateCliLogDialogStyle ();
+      loadCliLogFromFile ();
+    }
+  if (m_cliLogShowTimestampsCheck)
+    m_cliLogShowTimestampsCheck->setChecked (m_cliLogTimestampsShown);
+  if (m_cliLogSendAsCliCommandCheck)
+    {
+      m_cliLogSendAsCliCommandCheck->setChecked (m_cliLogInjectAsCliCommand);
+      m_cliLogInjectAsCliCommand =
+          m_cliLogSendAsCliCommandCheck->isChecked ();
+      if (m_cliOperatorInput != nullptr)
+        m_cliOperatorInput->setPlaceholderText (
+            m_cliLogInjectAsCliCommand
+                ? tr ("CLI command — Enter / Send: IN + echoed + executed")
+                : tr ("Operator note — Send as OUT [OPERATOR]; Idle client sees it"));
+    }
   updateCliLogDialogStyle ();
   m_cliLogDialog->setWindowTitle (tr ("CLI session log — %1").arg (m_cliServer->cliLogFilePath ()));
   m_cliLogDialog->show ();
@@ -5894,7 +6184,8 @@ void MainWindow::decodeDone ()
   if(finalDecodPass)
   {
     emit spectrumReady (m_cliSavgSnapshot, m_df3, dec_data.params.nfa, dec_data.params.nfb);
-    emit decodesReady  (m_cliDecodeAccumulator, m_cliCountryAccumulator);
+    emit decodesReady (m_cliDecodeAccumulator, m_cliCountryAccumulator,
+                       cliPendingAutoTxPlainText ());
     m_cliDecodeAccumulator.clear ();
     m_cliCountryAccumulator.clear ();
   }
@@ -10753,10 +11044,16 @@ void MainWindow::acceptQSO (QDateTime const& QSO_date_off, QString const& call, 
 {
   QString date = QSO_date_on.toString("yyyyMMdd");
   m_lastloggedcall=call; //ft8md
-  if (!m_logBook.add (call, grid, m_config.bands()->find(dial_freq), mode, ADIF))
+  bool const logged =
+      m_logBook.add (call, grid, m_config.bands()->find(dial_freq), mode, ADIF);
+  if (!logged)
     {
       MessageBox::warning_message (this, tr ("Log file error"),
                                    tr ("Cannot open \"%1\"").arg (m_logBook.path ()));
+    }
+  else if (m_cliServer)
+    {
+      m_cliServer->notifyQsoLogged (QSO_date_off, call, grid, dial_freq, mode);
     }
 
   m_messageClient->qso_logged (QSO_date_off, call, grid, dial_freq, mode, rpt_sent, rpt_received
@@ -13481,43 +13778,181 @@ void MainWindow::accumulateCliDecode (QString const& message)
   m_cliCountryAccumulator.append (cliCountryForMessage (message));
 }
 
+QString MainWindow::cliPendingAutoTxPlainText () const
+{
+  if (!m_auto || m_transmitting || m_tune)
+    return {};
+
+  QString txMsg;
+  switch (m_ntx)
+    {
+    case 1: txMsg = ui->tx1->text (); break;
+    case 2: txMsg = ui->tx2->text (); break;
+    case 3: txMsg = ui->tx3->text (); break;
+    case 4: txMsg = ui->tx4->text (); break;
+    case 5: txMsg = ui->tx5->currentText (); break;
+    case 6: txMsg = ui->tx6->text (); break;
+    default: break;
+    }
+  txMsg = txMsg.trimmed ();
+  if (txMsg.isEmpty ())
+    return {};
+  txMsg.replace (QLatin1Char ('\r'), QLatin1Char (' '));
+  txMsg.replace (QLatin1Char ('\n'), QLatin1Char (' '));
+  return txMsg.trimmed ();
+}
+
+namespace
+{
+QString abbrevCliDxccTerritoryForCli (QString entityName)
+{
+  if (entityName.isEmpty ())
+    return {};
+  entityName.replace (QStringLiteral ("Islands"),
+                      QStringLiteral ("Is."));
+  entityName.replace (QStringLiteral ("Island"), QStringLiteral ("Is."));
+  entityName.replace (QStringLiteral ("North "),
+                      QStringLiteral ("N. "));
+  entityName.replace (QStringLiteral ("Northern "),
+                      QStringLiteral ("N. "));
+  entityName.replace (QStringLiteral ("South "),
+                      QStringLiteral ("S. "));
+  entityName.replace (QStringLiteral ("East "), QStringLiteral ("E. "));
+  entityName.replace (QStringLiteral ("Eastern "), QStringLiteral ("E. "));
+  entityName.replace (QStringLiteral ("West "), QStringLiteral ("W. "));
+  entityName.replace (QStringLiteral ("Western "), QStringLiteral ("W. "));
+  entityName.replace (QStringLiteral ("Central "), QStringLiteral ("C. "));
+  entityName.replace (QStringLiteral (" and "), QStringLiteral (" & "));
+  entityName.replace (QStringLiteral ("Republic"), QStringLiteral ("Rep."));
+  entityName.replace (
+      QStringLiteral ("United States Of America"),
+      QStringLiteral ("U.S.A."));
+  entityName.replace (
+      QStringLiteral ("United States of America"),
+      QStringLiteral ("U.S.A."));
+  entityName.replace (QStringLiteral ("United States"), QStringLiteral ("U.S.A."));
+  entityName.replace (QStringLiteral ("Fed. Rep. of "), QStringLiteral (""));
+  entityName.replace (QStringLiteral ("French "), QStringLiteral ("Fr."));
+  entityName.replace (QStringLiteral ("Asiatic"),
+                      QStringLiteral ("AS"));
+  entityName.replace (QStringLiteral ("European"),
+                      QStringLiteral ("EU"));
+  entityName.replace (QStringLiteral ("African"),
+                      QStringLiteral ("AF"));
+  return entityName;
+}
+} // namespace
+
 QString MainWindow::cliCountryForMessage (QString const& message) const
 {
-  DecodedText const dt (message);
+  // Recover the FT8/FT4 payload the same way the CLI message column does (TcpCliServer), but tolerate
+  // NBSP/tabs/other whitespace that breaks single-space splitting. Fall back to the fixed-prefix offset
+  // from DecodedText (GUI path) when token split yields too few fields.
+  QString norm = message.trimmed ();
+  norm.replace (QChar (0x00a0), QLatin1Char (' '));
+  norm.remove (QLatin1Char ('\r'));
+  norm.remove (QLatin1Char ('\n'));
+
+  QStringList const tok =
+    norm.split (QRegularExpression (QStringLiteral ("\\s+")), Qt::SkipEmptyParts);
+
+  QString pay;
+  if (tok.size () >= 6)
+    {
+      pay = tok.mid (5).join (QLatin1Char (' '));
+    }
+  else
+    {
+      DecodedText const layoutProbe {norm};
+      int const pref = layoutProbe.prefixFieldLength ();
+      if (pref > 0 && norm.size () > pref)
+        {
+          pay = norm.mid (pref).trimmed ();
+        }
+    }
+
+  QString const synthLine = (!pay.isEmpty ())
+    ? (QString (22, QLatin1Char (' ')) + pay)
+    : norm;
+  DecodedText const dt (synthLine);
   QString deCall, deGrid;
   dt.deCallAndGrid (deCall, deGrid);
-  if (deCall.isEmpty ())
+
+  // tokens_re often mis-parses CQ lines: "CQ RU9CZ" is read as directional "CQ RU" + word2 "9CZ"
+  // (same for "CQ DK6WH" → "6WH"). Those fragments are length ≥3 so the CQersCall fallback below
+  // never ran. Use CQersCall first for CQ/QRZ/DE — same idea as the dedicated regex in DecodedText.
+  QString call = deCall;
+  bool const cqish = !pay.isEmpty ()
+    && (pay.startsWith (QLatin1String ("CQ "), Qt::CaseInsensitive)
+        || pay.startsWith (QLatin1String ("CQDX"), Qt::CaseInsensitive)
+        || pay.startsWith (QLatin1String ("QRZ "), Qt::CaseInsensitive)
+        || pay.startsWith (QLatin1String ("DE "), Qt::CaseInsensitive));
+  if (cqish)
+    {
+      QString const cq = dt.CQersCall ();
+      if (cq.size () >= 3)
+        {
+          call = cq;
+        }
+    }
+
+  // Match DisplayText::appendWorkedB4 — directional CQ (e.g. "CQ EU XYZ") exposes a 2-char word2 token.
+  if (call.size () == 2)
+    {
+      QString const lineForCq = dt.string ().trimmed ();
+      int const i0 = lineForCq.indexOf ("CQ " + call);
+      if (i0 >= 0)
+        {
+          call = lineForCq.mid (i0 + 6); // after "CQ " + two-char directional
+          int const ws = call.indexOf (' ');
+          if (ws >= 0)
+            {
+              call = call.left (ws);
+            }
+        }
+    }
+
+  if (call.size () < 3)
+    {
+      QString const cq = dt.CQersCall ();
+      if (cq.size () >= 3)
+        {
+          call = cq;
+        }
+    }
+
+  call = Radio::base_callsign (call).trimmed ();
+  if (call.isEmpty ())
     {
       return QString (QChar (0x2014));
     }
-  auto const& looked_up = m_logBook.countries ()->lookup (deCall);
-  auto countryName = looked_up.entity_name;
+
+  auto const& looked_up = m_logBook.countries ()->lookup (call);
+  QString const countryName = looked_up.entity_name;
   if (countryName.isEmpty ())
     {
       return QString (QChar (0x2014));
     }
-  // Same short labels as the main-window territory filter (decode list)
-  countryName.replace (QStringLiteral ("Islands"), QStringLiteral ("Is."));
-  countryName.replace (QStringLiteral ("Island"), QStringLiteral ("Is."));
-  countryName.replace (QStringLiteral ("North "), QStringLiteral ("N. "));
-  countryName.replace (QStringLiteral ("Northern "), QStringLiteral ("N. "));
-  countryName.replace (QStringLiteral ("South "), QStringLiteral ("S. "));
-  countryName.replace (QStringLiteral ("East "), QStringLiteral ("E. "));
-  countryName.replace (QStringLiteral ("Eastern "), QStringLiteral ("E. "));
-  countryName.replace (QStringLiteral ("West "), QStringLiteral ("W. "));
-  countryName.replace (QStringLiteral ("Western "), QStringLiteral ("W. "));
-  countryName.replace (QStringLiteral ("Central "), QStringLiteral ("C. "));
-  countryName.replace (QStringLiteral (" and "), QStringLiteral (" & "));
-  countryName.replace (QStringLiteral ("Republic"), QStringLiteral ("Rep."));
-  countryName.replace (QStringLiteral ("United States Of America"), QStringLiteral ("U.S.A."));
-  countryName.replace (QStringLiteral ("United States of America"), QStringLiteral ("U.S.A."));
-  countryName.replace (QStringLiteral ("United States"), QStringLiteral ("U.S.A."));
-  countryName.replace (QStringLiteral ("Fed. Rep. of "), QStringLiteral (""));
-  countryName.replace (QStringLiteral ("French "), QStringLiteral ("Fr."));
-  countryName.replace (QStringLiteral ("Asiatic"), QStringLiteral ("AS"));
-  countryName.replace (QStringLiteral ("European"), QStringLiteral ("EU"));
-  countryName.replace (QStringLiteral ("African"), QStringLiteral ("AF"));
-  return countryName;
+  return abbrevCliDxccTerritoryForCli (countryName);
+}
+
+QString MainWindow::cliCountryForSpottedReceiver (
+    QString const& receiverCallsign) const
+{
+  QString const call =
+      Radio::base_callsign (receiverCallsign).trimmed ().toUpper ();
+  if (call.isEmpty ())
+    {
+      return QString (QChar (0x2014));
+    }
+
+  auto const& looked_up = m_logBook.countries ()->lookup (call);
+  QString const countryName = looked_up.entity_name;
+  if (countryName.isEmpty ())
+    {
+      return QString (QChar (0x2014));
+    }
+  return abbrevCliDxccTerritoryForCli (countryName);
 }
 
 void MainWindow::postWSPRDecode (bool is_new, QStringList parts)
@@ -13585,27 +14020,32 @@ void MainWindow::connectCli (TcpCliServer* cli)
   });
 
   // CLI "set callsign" → update config + refresh TX messages
-  connect (cli, &TcpCliServer::setCallsignSignal, this, [this, cli](QString const& call) {
+  connect (cli, &TcpCliServer::setCallsignSignal, this, [this](QString const& call) {
     m_config.set_my_callsign (call);
     m_baseCall = Radio::base_callsign (call);
     genStdMsgs (m_rpt, true);
-    cli->setStationSnapshot (m_config.my_callsign (), m_config.my_grid ());
+    syncCliServerSnapshot ();
   });
 
   // CLI "set grid" / "set location" → update config + refresh TX messages
-  connect (cli, &TcpCliServer::setGridSignal, this, [this, cli](QString const& grid) {
+  connect (cli, &TcpCliServer::setGridSignal, this, [this](QString const& grid) {
     m_config.set_my_grid (grid);
     genStdMsgs (m_rpt, true);
-    cli->setStationSnapshot (m_config.my_callsign (), m_config.my_grid ());
+    syncCliServerSnapshot ();
   });
 
   // Mirror station identity for CLI `status` (seed + settings dialog + CLI set above)
-  cli->setStationSnapshot (m_config.my_callsign (), m_config.my_grid ());
-  connect (&m_config, &Configuration::leavingSettings, cli, [cli, this] (bool) {
-    cli->setStationSnapshot (m_config.my_callsign (), m_config.my_grid ());
+  syncCliServerSnapshot ();
+  connect (&m_config, &Configuration::leavingSettings, this, [this] (bool) {
+    syncCliServerSnapshot ();
   });
 
   connect (cli, &TcpCliServer::cliLogLineAppended, this, &MainWindow::onCliLogLineAppended);
+  cli->setSpotsReceiverCountryFormatter (
+      [this] (QString const& recv) {
+        return cliCountryForSpottedReceiver (recv);
+      });
+
   ui->actionCLI_Log->setEnabled (true);
 }
 
@@ -13951,6 +14391,7 @@ void MainWindow::setRig (Frequency f)
       && m_frequency_list_fcal_iter != m_config.frequencies ()->end ()) {
     m_freqNominal = m_frequency_list_fcal_iter->frequency_ - ui->RxFreqSpinBox->value ();
   }
+  syncCliServerSnapshot ();
   if(m_transmitting && !m_config.tx_QSY_allowed ()) return;
   if ((m_monitoring || m_transmitting) && m_config.transceiver_online ())
     {

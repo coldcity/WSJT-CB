@@ -25,6 +25,11 @@ namespace Radio
     QRegularExpression cb_callsign_re {
       R"(^(?:[0-9][A-Z]{1,2}[0-9]{1,4}|[0-9]{2,3}[A-Z]{1,2}[0-9]{1,3})$)"};
 
+    // Exact match only — is_cb_callsign must not trigger on amateur calls that merely *contain*
+    // a digit-letter-digit slice (those were routed through the CB DXCC shortcut and showed as unknown).
+    QRegularExpression cb_callsign_exact_re {
+      R"(\A(?:[0-9][A-Z]{1,2}[0-9]{1,4}|[0-9]{2,3}[A-Z]{1,2}[0-9]{1,3})\z)"};
+
     // very loose validation - callsign must contain a letter next to
     // a number
     QRegularExpression valid_callsign_regexp {R"(\d[[:alpha:]]|[[:alpha:]]\d)"};
@@ -150,7 +155,12 @@ namespace Radio
 
   bool is_cb_callsign (QString const& callsign)
   {
-    return callsign.toUpper ().contains (cb_callsign_re);
+    auto const trimmed = callsign.trimmed ().toUpper ();
+    if (trimmed.isEmpty ())
+      {
+        return false;
+      }
+    return cb_callsign_exact_re.match (trimmed).hasMatch ();
   }
 
   bool is_compound_callsign (QString const& callsign)

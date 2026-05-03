@@ -64,6 +64,10 @@ __pycache__/
 *.pyc
 scripts/check_callsign.py
 
+# pyclient — local driver config (secrets / machine paths); copy from wsjt-driver.example.toml
+/wsjt-driver.toml
+pyclient/wsjt-driver.toml
+
 # Mac
 .DS_Store
 

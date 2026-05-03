@@ -1,0 +1,2 @@
+# Optional on Python 3.10 and earlier (3.11+ has stdlib tomllib)
+tomli>=1.2.0,<3

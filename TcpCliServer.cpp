@@ -1,15 +1,56 @@
 #include "TcpCliServer.hpp"
 
+#include "Decoder/decodedtext.h"
+#include "Radio.hpp"
+
 #include <QCoreApplication>
-#include <QHostAddress>
-#include <QDateTime>
 #include <QCryptographicHash>
+#include <QDateTime>
+#include <QHostAddress>
 #include <QIODevice>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLocale>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QRegularExpression>
+#include <QStringList>
+#include <QTimer>
+#include <QUrlQuery>
+#include <QXmlStreamReader>
 #include <QVector>
 #include <QtMath>
 #include <algorithm>
 #include <cmath>
+
+namespace
+{
+QString trimTrailingZerosMHz (QString s)
+{
+    if (!s.contains (QLatin1Char ('.')))
+        return s;
+    while (s.endsWith (QLatin1Char ('0')))
+        s.chop (1);
+    if (s.endsWith (QLatin1Char ('.')))
+        s.chop (1);
+    return s;
+}
+
+QString normalizeCliChatText (QString t)
+{
+    t.replace (QRegularExpression (QStringLiteral (R"([\r\n]+)")), QStringLiteral (" "));
+    return t.trimmed ();
+}
+
+bool cliPayloadIsOnlyLineBreaks(QString const& s)
+{
+    for (QChar const ch : s)
+        if (ch != QLatin1Char('\r') && ch != QLatin1Char('\n'))
+            return false;
+    return true;
+}
+} // namespace
 
 // ---------------------------------------------------------------------------
 // CLI transcript log (exe directory, append-only)
@@ -17,7 +58,11 @@
 
 void TcpCliServer::appendSingleCliLogLine(QString const& role, QString const& text)
 {
-    if (text.isEmpty())
+    // Bare CRLF-before-burst markers are logged as the two-character payload "\n".
+    // Do not write or emit transcript lines for these (still sent on TCP as intended).
+    if (role == QStringLiteral ("OUT") && text == QStringLiteral ("\\n"))
+        return;
+    if (cliPayloadIsOnlyLineBreaks(text))
         return;
     QString t = text;
     t.replace(QLatin1Char('\r'), QStringLiteral("\\r"));
@@ -35,7 +80,7 @@ void TcpCliServer::appendSingleCliLogLine(QString const& role, QString const& te
 void TcpCliServer::appendCliLog(QString const& role, QString const& text)
 {
     // One timestamp per physical line: split CR/LF so spectrum never logs as literal \r \n
-    if (text.isEmpty())
+    if (cliPayloadIsOnlyLineBreaks(text))
         return;
     if (!text.contains(QLatin1Char('\r')) && !text.contains(QLatin1Char('\n')))
     {
@@ -46,7 +91,7 @@ void TcpCliServer::appendCliLog(QString const& role, QString const& text)
     const QStringList parts = text.split(reSplit, Qt::SkipEmptyParts);
     for (QString const& part : parts)
     {
-        if (!part.isEmpty())
+        if (!cliPayloadIsOnlyLineBreaks(part))
             appendSingleCliLogLine(role, part);
     }
 }
@@ -76,6 +121,13 @@ TcpCliServer::TcpCliServer(quint16 port, QString const& password,
     connect(&m_server, &QTcpServer::newConnection,
             this,      &TcpCliServer::onNewConnection);
 
+    m_pskspotsAutoTimer.setParent (this);
+    m_pskspotsAutoTimer.setTimerType (Qt::CoarseTimer);
+    m_pskspotsAutoTimer.setInterval (300000); // 5 min — matches pskreporter.info retrieve guidance
+    m_pskspotsAutoTimer.setSingleShot (false);
+    connect (&m_pskspotsAutoTimer, &QTimer::timeout,
+             this,                 &TcpCliServer::onPskSpotsAutoTimer);
+
     if (!m_server.listen(bindAddress, port))
     {
         qWarning("TcpCliServer: failed to listen on %s:%d: %s",
@@ -91,6 +143,14 @@ TcpCliServer::TcpCliServer(quint16 port, QString const& password,
 
 TcpCliServer::~TcpCliServer()
 {
+    m_pskspotsAutoTimer.stop ();
+    if (m_pskspotsReply)
+    {
+        QObject::disconnect (m_pskspotsReply, nullptr, this, nullptr);
+        m_pskspotsReply->abort ();
+        m_pskspotsReply->deleteLater ();
+        m_pskspotsReply.clear ();
+    }
     if (m_cliLog.isOpen())
     {
         appendCliLog(QStringLiteral("SYS"), QStringLiteral("TcpCliServer shutdown"));
@@ -129,6 +189,7 @@ void TcpCliServer::onNewConnection()
     m_selectedFreq = 1200;
     m_selectedDecode.clear();
     m_selectedCountry.clear();
+    m_selectedDxBaseUpper.clear();
 
     connect(m_client, &QTcpSocket::disconnected,
             this,     &TcpCliServer::onClientDisconnected);
@@ -152,6 +213,9 @@ void TcpCliServer::onNewConnection()
         sendWelcomeBanner();
         sendPrompt();
     }
+    // Arm next-tick only (no HTTP here); first auto query is 5 min after this event returns.
+    QTimer::singleShot (0, this, [this]
+                        { updatePskSpotsAutoTimer (); });
 }
 
 void TcpCliServer::onClientDisconnected()
@@ -168,7 +232,9 @@ void TcpCliServer::onClientDisconnected()
     m_selectedFreq = 1200;
     m_selectedDecode.clear();
     m_selectedCountry.clear();
+    m_selectedDxBaseUpper.clear();
     m_readBuf.clear();
+    updatePskSpotsAutoTimer ();
     Q_EMIT clientDisconnected();
 }
 
@@ -223,16 +289,83 @@ static constexpr int kCliDecodeIndentCols = 11;
 // Returns the audio frequency field as an integer, or -1 on parse failure.
 static int extractFreqFromDecode(QString const& raw)
 {
-    QStringList p = raw.trimmed().split(' ', Qt::SkipEmptyParts);
+    QStringList p = raw.trimmed().split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
     if (p.size() < 4) return -1;
     bool ok;
     int f = p[3].toInt(&ok);
     return ok ? f : -1;
 }
 
+// DX base call extracted like MainWindow::cliCountryForMessage (DecodedText path + CQ/QRZ/DE quirks).
+static QString cliDxBaseCallUpperFromRaw (QString const& raw)
+{
+    QString norm = raw.trimmed ();
+    norm.replace (QChar (0x00a0), QLatin1Char (' '));
+    norm.remove (QLatin1Char ('\r'));
+    norm.remove (QLatin1Char ('\n'));
+
+    QStringList const tok =
+        norm.split (QRegularExpression (QStringLiteral ("\\s+")), Qt::SkipEmptyParts);
+
+    QString pay;
+    if (tok.size () >= 6)
+        pay = tok.mid (5).join (QLatin1Char (' '));
+    else
+    {
+        DecodedText const layoutProbe {norm};
+        int const pref = layoutProbe.prefixFieldLength ();
+        if (pref > 0 && norm.size () > pref)
+            pay = norm.mid (pref).trimmed ();
+    }
+
+    QString const synthLine = (!pay.isEmpty ())
+        ? (QString (22, QLatin1Char (' ')) + pay)
+        : norm;
+    DecodedText const dt (synthLine);
+    QString deCall, deGrid;
+    dt.deCallAndGrid (deCall, deGrid);
+
+    QString call = deCall;
+    bool const cqish = !pay.isEmpty ()
+        && (pay.startsWith (QLatin1String ("CQ "), Qt::CaseInsensitive)
+            || pay.startsWith (QLatin1String ("CQDX"), Qt::CaseInsensitive)
+            || pay.startsWith (QLatin1String ("QRZ "), Qt::CaseInsensitive)
+            || pay.startsWith (QLatin1String ("DE "), Qt::CaseInsensitive));
+    if (cqish)
+    {
+        QString const cq = dt.CQersCall ();
+        if (cq.size () >= 3)
+            call = cq;
+    }
+
+    if (call.size () == 2)
+    {
+        QString const lineForCq = dt.string ().trimmed ();
+        int const i0 = lineForCq.indexOf ("CQ " + call);
+        if (i0 >= 0)
+        {
+            call = lineForCq.mid (i0 + 6);
+            int const ws = call.indexOf (' ');
+            if (ws >= 0)
+                call = call.left (ws);
+        }
+    }
+
+    if (call.size () < 3)
+    {
+        QString const cq = dt.CQersCall ();
+        if (cq.size () >= 3)
+            call = cq;
+    }
+
+    return Radio::base_callsign (call).trimmed ().toUpper ();
+}
+
 // FT8 on-the-air text is short; keep this small so the country column sits left of big empty gaps.
 static constexpr int kCliMessageCols  = 20; // left-justified; longer text truncated; aligns country
 static constexpr int kCliCountryCols = 16;
+// Decode line: glyphs @ * ! (when applicable), left-padded in this width, plus one space, then [FFFF].
+static constexpr int kCliMarkBandChars = 4;
 
 static QString formatMessageFieldForCli(QString m)
 {
@@ -252,13 +385,28 @@ static QString formatCountryField(QString c)
     return c.leftJustified(kCliCountryCols, QLatin1Char(' '));
 }
 
-// Returns "  [FFFF]  snr  dt  <padded message>  country" — fixed-width; mode (raw p[4]) omitted (FT8 CLI).
-// Two-char mark before [freq]: "!" + space for CQ, else two spaces, so the "[" column stays bar-aligned.
-// Message is left-justified in kCliMessageCols (truncated if needed) so the country column lines up.
-// Raw line: time snr dt freq mode [words...]; freq is moved to a bracketed prefix, not shown twice.
-static QString formatDecodeForDisplay(QString const& raw, QString const& country)
+// True if decoded message words contain my callsign as a whole token (case-insensitive).
+static bool cliDecodeMentionsMyCall (QString const& msgWords,
+                                     QString const& myCall)
 {
-    QStringList p = raw.trimmed().split(' ', Qt::SkipEmptyParts);
+  QString const c = myCall.trimmed ();
+  if (c.size () < 1)
+    return false;
+  QString const esc = QRegularExpression::escape (c);
+  QRegularExpression const re (
+      QStringLiteral (R"(\b)") + esc + QStringLiteral (R"(\b)"),
+      QRegularExpression::CaseInsensitiveOption);
+  return msgWords.contains (re);
+}
+
+// Returns fixed-width CLI decode row (mode omitted). Mark band: any of @ * ! may appear together,
+// packed in that order then left-padded to kCliMarkBandChars plus one space before [FFFF].
+static QString formatDecodeForDisplay (QString const& raw,
+                                       QString const& country,
+                                       QString const& myCallsign,
+                                       QString const& selectedDxBaseUpper)
+{
+    QStringList p = raw.trimmed().split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
     if (p.size() < 5)
         return raw.trimmed();
 
@@ -280,10 +428,20 @@ static QString formatDecodeForDisplay(QString const& raw, QString const& country
         : p[2].rightJustified(4, QLatin1Char(' '));
 
     QString const msg = (p.size() > 5) ? p.mid(5).join(QLatin1Char(' ')) : QString();
-    QString const markPrefix = msg.contains(QStringLiteral("CQ"), Qt::CaseInsensitive)
-        ? QStringLiteral("! ")
-        : QStringLiteral("  ");
-    QString const freqWithMark = markPrefix + freqField;
+    QString const dxBand = cliDxBaseCallUpperFromRaw (raw);
+
+    QString glyphs;
+    if (cliDecodeMentionsMyCall (msg, myCallsign))
+        glyphs += QLatin1Char ('@');
+    if (!selectedDxBaseUpper.isEmpty () && dxBand == selectedDxBaseUpper)
+        glyphs += QLatin1Char ('*');
+    if (msg.contains (QStringLiteral ("CQ"), Qt::CaseInsensitive))
+        glyphs += QLatin1Char ('!');
+
+    QString const markBand =
+        glyphs.leftJustified (kCliMarkBandChars, QLatin1Char (' '))
+        + QLatin1Char (' ');
+    QString const freqWithMark = markBand + freqField;
     QString const msgCol = formatMessageFieldForCli(msg);
     QString const ccol = formatCountryField(country);
 
@@ -296,7 +454,7 @@ static QString formatDecodeForDisplay(QString const& raw, QString const& country
 // select <Hz> — shared by select / answer <Hz> / cq <Hz>
 // ---------------------------------------------------------------------------
 
-bool TcpCliServer::trySelectAudioFreq(int freqHz)
+bool TcpCliServer::trySelectAudioFreq(int freqHz, bool sendOkOnSuccess)
 {
     if (freqHz <= 0)
     {
@@ -314,6 +472,7 @@ bool TcpCliServer::trySelectAudioFreq(int freqHz)
     m_selectedFreq = freqHz;
     m_selectedDecode.clear();
     m_selectedCountry.clear();
+    m_selectedDxBaseUpper.clear ();
     for (int i = 0; i < m_lastDecodes.size(); ++i)
     {
         QString const& raw = m_lastDecodes[i];
@@ -326,15 +485,22 @@ bool TcpCliServer::trySelectAudioFreq(int freqHz)
         }
     }
 
+    if (!m_selectedDecode.isEmpty ())
+        m_selectedDxBaseUpper = cliDxBaseCallUpperFromRaw (m_selectedDecode);
+
     emit setTxAudioFreqSignal(freqHz);
     emit setRxAudioFreqSignal(freqHz);
 
-    if (m_selectedDecode.isEmpty())
-        sendLine(QString("OK: selected %1 Hz (no decode here — valid for cq)")
-                 .arg(freqHz));
-    else
-        sendLine(QString("OK: selected %1")
-                 .arg(formatDecodeForDisplay(m_selectedDecode, m_selectedCountry)));
+    if (sendOkOnSuccess)
+    {
+        if (m_selectedDecode.isEmpty())
+            sendLine(QString("OK: selected %1 Hz (no decode here — valid for cq)")
+                     .arg(freqHz));
+        else
+            sendLine(QString("OK: selected %1")
+                     .arg(formatDecodeForDisplay (m_selectedDecode, m_selectedCountry,
+                                                  m_myCallsign, m_selectedDxBaseUpper)));
+    }
     return true;
 }
 
@@ -342,7 +508,7 @@ bool TcpCliServer::trySelectAudioFreq(int freqHz)
 // Command dispatch
 // ---------------------------------------------------------------------------
 
-// h help · b bye · s status · f select · c cq · a answer · x stoptx
+// h help · b bye · s status · f select · c cq · a answer · x stoptx · n comment
 static void expandOneLetterAuthed(QString& cmd)
 {
     if (cmd.size() != 1) return;
@@ -354,6 +520,7 @@ static void expandOneLetterAuthed(QString& cmd)
     case u'a': cmd = QStringLiteral("answer"); break;
     case u'c': cmd = QStringLiteral("cq"); break;
     case u'x': cmd = QStringLiteral("stoptx"); break;
+    case u'n': cmd = QStringLiteral("comment"); break;
     default:   break;
     }
 }
@@ -437,6 +604,19 @@ void TcpCliServer::processLine(QString const& line)
     {
         printStatus();
     }
+    else if (cmd == "comment")
+    {
+        QString const t = normalizeCliChatText (parts.mid (1).join (QLatin1Char (' ')));
+        if (t.isEmpty ())
+        {
+            sendLine (
+                QStringLiteral ("ERR: usage: comment <text>   (one letter: n <text>)"));
+        }
+        else
+        {
+            /* IN logged in onReadyRead; no TCP OK — sendPrompt follows in processLine */
+        }
+    }
     else if (cmd == "set" && parts.size() >= 3)
     {
         handleSet(parts);
@@ -497,6 +677,47 @@ void TcpCliServer::processLine(QString const& line)
         emit stopTxSignal();
         sendLine("OK: TX stopped — use cq or answer to start a new sequence");
     }
+    else if (cmd == "spots")
+    {
+        if (m_pskspotsReply)
+        {
+            sendLine (QStringLiteral (
+                "ERR: spots query already in progress — wait for results"));
+            sendPrompt ();
+            return;
+        }
+        int lim                                  = 20;
+        constexpr int const kCliSpotsDefault   = 20;
+        constexpr int const kCliSpotsHardCap   = 200;
+        if (parts.size () >= 2)
+        {
+            bool ok                                           = false;
+            lim                                               = parts[1].toInt (&ok);
+            if (!ok || lim <= 0)
+            {
+                sendLine (
+                    QStringLiteral ("ERR: usage: spots [<n>]  "
+                                    "(positive integer; default ") +
+                    QString::number (kCliSpotsDefault)
+                    + QStringLiteral ("; max ")
+                    + QString::number (kCliSpotsHardCap) + QLatin1Char (')'));
+                sendPrompt ();
+                return;
+            }
+        }
+        lim = qBound (1, lim, kCliSpotsHardCap);
+        QString const callUp = m_myCallsign.trimmed ().toUpper ();
+        if (callUp.isEmpty ())
+        {
+            sendLine (
+                QStringLiteral ("ERR: spots needs your callsign — set it in Settings "
+                                "or: set callsign <CALL>"));
+            sendPrompt ();
+            return;
+        }
+        beginPskReporterSpotsQuery (callUp, lim, false);
+        return;
+    }
     else if (cmd == "answer")
     {
         if (parts.size() >= 2)
@@ -509,7 +730,7 @@ void TcpCliServer::processLine(QString const& line)
                 sendPrompt();
                 return;
             }
-            if (!trySelectAudioFreq(freqHz))
+            if (!trySelectAudioFreq(freqHz, false))
             {
                 sendPrompt();
                 return;
@@ -539,8 +760,12 @@ void TcpCliServer::processLine(QString const& line)
             QString msg  = p.size() > 5 ? p.mid(5).join(' ') : QString{};
 
             emit replySignal(t, snr, dt, freq, mode, msg, false, 0);
-            sendLine(QString("OK: answering %1")
-                     .arg(formatDecodeForDisplay(m_selectedDecode, m_selectedCountry)));
+            sendLine (
+                QStringLiteral ("OK: answering %1")
+                    .arg (
+                        formatDecodeForDisplay (
+                            m_selectedDecode, m_selectedCountry, m_myCallsign,
+                            m_selectedDxBaseUpper)));
         }
     }
     else
@@ -597,6 +822,284 @@ void TcpCliServer::handleSet(QStringList const& parts)
     }
 }
 
+void TcpCliServer::beginPskReporterSpotsQuery (QString const& senderCallUpper, int limit,
+                                               bool fromAutoTimer)
+{
+    Q_ASSERT (!m_pskspotsReply);
+
+    if (!fromAutoTimer)
+        restartPskSpotsAutoTimerCooldown ();
+
+    if (!m_pskretrieveNam)
+        m_pskretrieveNam = new QNetworkAccessManager (this);
+
+    QUrl url (QStringLiteral ("https://retrieve.pskreporter.info/query"));
+    QUrlQuery qry;
+    qry.addQueryItem (QStringLiteral ("senderCallsign"), senderCallUpper);
+    qry.addQueryItem (QStringLiteral ("rptlimit"), QString::number (limit));
+    // retrieve API: negative seconds = lookback (max 24 h). Auto polls every 5 min — use
+    // a 5 min window to match intent and reduce load; manual `spots` keeps 24 h for history.
+    qry.addQueryItem (QStringLiteral ("flowStartSeconds"),
+                      QString::number (fromAutoTimer ? -300 : -86400));
+    qry.addQueryItem (QStringLiteral ("noactive"), QStringLiteral ("1"));
+    url.setQuery (qry);
+
+    QNetworkRequest req (url);
+    req.setRawHeader ("User-Agent",
+                      QByteArrayLiteral ("WSJT-CB CLI (retrieve.pskreporter.info query)"));
+
+    QNetworkReply* reply = m_pskretrieveNam->get (req);
+    m_pskspotsReply        = reply;
+
+    QObject::connect (reply, &QNetworkReply::finished, this,
+                      [this, senderCallUpper, fromAutoTimer, reply] ()
+                      {
+                          QString const netErr = reply->errorString ();
+                          QNetworkReply::NetworkError const ner =
+                              reply->error ();
+                          QByteArray const body = reply->readAll ();
+                          reply->deleteLater ();
+                          if (m_pskspotsReply.data () == reply)
+                              m_pskspotsReply.clear ();
+
+                          if (!m_client || m_state != State::Idle)
+                              return;
+
+                          if (ner != QNetworkReply::NoError)
+                          {
+                              if (ner == QNetworkReply::OperationCanceledError)
+                              {
+                                  sendPrompt ();
+                                  return;
+                              }
+                              sendLine (
+                                  QStringLiteral ("ERR: PSK Reporter network: %1")
+                                      .arg (netErr));
+                              sendPrompt ();
+                              return;
+                          }
+
+                          QByteArray const trimmedBody = body.trimmed ();
+                          if (trimmedBody.startsWith ('{'))
+                          {
+                              QJsonDocument const jd =
+                                  QJsonDocument::fromJson (body, nullptr);
+                              if (jd.isObject ())
+                              {
+                                  QJsonObject const o = jd.object ();
+                                  if (o.contains (QStringLiteral ("message")))
+                                  {
+                                      sendLine (
+                                          QStringLiteral ("ERR: PSK Reporter: %1")
+                                              .arg (o.value (QStringLiteral ("message")).toString ()));
+                                      sendPrompt ();
+                                      return;
+                                  }
+                              }
+                          }
+
+                          QString const bodyHead = QString::fromUtf8 (trimmedBody);
+                          if (bodyHead.startsWith (QLatin1String ("<!DOCTYPE"),
+                                                   Qt::CaseInsensitive)
+                              || bodyHead.contains (QStringLiteral ("Enable JavaScript"),
+                                                    Qt::CaseInsensitive)
+                              || bodyHead.contains (QStringLiteral ("challenge-platform"),
+                                                   Qt::CaseInsensitive))
+                          {
+                              sendLine (QStringLiteral (
+                                  "ERR: PSK Reporter returned HTML (blocked or verification "
+                                  "page)"));
+                              sendPrompt ();
+                              return;
+                          }
+
+                          QVector<QStringList> rows;
+                          QXmlStreamReader xr (QString::fromUtf8 (body));
+                          while (!xr.atEnd ())
+                          {
+                              xr.readNext ();
+                              if (!xr.isStartElement ())
+                                  continue;
+                              if (xr.name () != QLatin1String ("receptionReport"))
+                                  continue;
+
+                              auto av = [&] (char const* key) -> QString
+                              {
+                                  return xr.attributes ()
+                                      .value (QString::fromLatin1 (key))
+                                      .toString ();
+                              };
+
+                              QString const send =
+                                  av ("senderCallsign").toUpper ().trimmed ();
+                              if (!send.isEmpty () && send != senderCallUpper)
+                                  continue;
+
+                              bool okSecs    = false;
+                              qint64 const sec =
+                                  av ("flowStartSeconds").trimmed ().toLongLong (&okSecs);
+                              QString const utc =
+                                  okSecs
+                                      ? QDateTime::fromSecsSinceEpoch (
+                                            sec,
+                                            Qt::UTC)
+                                          .toString (
+                                              QLatin1String (
+                                                  "yyyy-MM-dd hh:mm:ss"))
+                                      : QString ();
+
+                              quint64 fqHz{};
+                              bool okF = false;
+                              fqHz     = av ("frequency").trimmed ().toULongLong (&okF);
+                              QString const mhz =
+                                  okF
+                                      ? trimTrailingZerosMHz (
+                                          Radio::frequency_MHz_string (
+                                              fqHz,
+                                              6,
+                                              QLocale::c ()))
+                                      : QStringLiteral ("?");
+
+                              QString sn = av ("sNR").trimmed ();
+                              if (sn.isEmpty ())
+                                  sn = av ("snr").trimmed ();
+
+                              rows.push_back (
+                                  {utc,
+                                   mhz,
+                                   av ("mode"),
+                                   av ("receiverCallsign"),
+                                   av ("receiverLocator"),
+                                   sn});
+                          }
+
+                          if (xr.hasError ())
+                          {
+                              sendLine (QStringLiteral (
+                                  "ERR: PSK Reporter: could not parse XML"));
+                              sendPrompt ();
+                              return;
+                          }
+
+                          QString const autoTag =
+                              fromAutoTimer ? QStringLiteral (" [auto]") : QString ();
+                          sendLine (
+                              QStringLiteral ("OK: Spots for %1%2")
+                                  .arg (senderCallUpper)
+                                  .arg (autoTag));
+                          constexpr int spotUtcW        = 19;
+                          constexpr int spotMhzW        = 11;
+                          constexpr int spotModeW       = 10;
+                          constexpr int spotCallW       = 13;
+                          constexpr int spotGridW       = 12;
+                          constexpr int spotSnrW        = 5;
+                          constexpr int spotCountryColW = 16;
+                          QString const dashCountry =
+                              QString (QChar (0x2014)).leftJustified (
+                                  spotCountryColW,
+                                  QLatin1Char (' '));
+                          auto clipField =
+                              [](QString s, int w) -> QString
+                              {
+                                  s = s.trimmed ();
+                                  if (s.size () > w)
+                                      s = s.left (w);
+                                  return s.leftJustified (
+                                      w,
+                                      QLatin1Char (' '));
+                              };
+                          for (QStringList const& r : rows)
+                          {
+                              QString sn = r.value (5).trimmed ();
+                              if (sn.isEmpty ())
+                                  sn = QStringLiteral ("--");
+
+                              QString countryCol = dashCountry;
+                              if (m_spotsRcvrCountryFmt)
+                                {
+                                  QString c = m_spotsRcvrCountryFmt (
+                                                  r.value (3))
+                                                  .trimmed ();
+                                  if (!c.isEmpty ())
+                                    {
+                                      if (c.size () > spotCountryColW)
+                                          c =
+                                              c.left (spotCountryColW);
+                                      countryCol =
+                                          c.leftJustified (
+                                              spotCountryColW,
+                                              QLatin1Char (' '));
+                                    }
+                                }
+
+                              // UTC … MHz … mode … RX callsign … locator … SNR … country (decode-style CTY abbrev)
+                              sendLine (
+                                  QStringLiteral ("  %1 %2 %3 %4 %5 %6 %7")
+                                      .arg (
+                                          clipField (r.value (0),
+                                                     spotUtcW),
+                                          clipField (r.value (1),
+                                                     spotMhzW),
+                                          clipField (r.value (2),
+                                                     spotModeW),
+                                          clipField (r.value (3),
+                                                     spotCallW),
+                                          clipField (r.value (4),
+                                                     spotGridW),
+                                          clipField (sn, spotSnrW),
+                                          countryCol));
+                          }
+                          if (rows.isEmpty ())
+                              sendLine (QStringLiteral (
+                                  "  (no rows — no recent uploads of your Tx to "
+                                  "PSK Reporter in this query window)"));
+                          sendPrompt ();
+                      });
+}
+
+void TcpCliServer::restartPskSpotsAutoTimerCooldown ()
+{
+    bool const enable =
+        m_client && m_client->state () == QAbstractSocket::ConnectedState
+        && m_state == State::Idle && !m_myCallsign.trimmed ().isEmpty ();
+    if (enable)
+        m_pskspotsAutoTimer.start ();
+    else
+        m_pskspotsAutoTimer.stop ();
+}
+
+void TcpCliServer::updatePskSpotsAutoTimer ()
+{
+    bool const enable =
+        m_client && m_client->state () == QAbstractSocket::ConnectedState
+        && m_state == State::Idle && !m_myCallsign.trimmed ().isEmpty ();
+    if (enable)
+    {
+        if (!m_pskspotsAutoTimer.isActive ())
+            m_pskspotsAutoTimer.start ();
+    }
+    else
+        m_pskspotsAutoTimer.stop ();
+}
+
+void TcpCliServer::onPskSpotsAutoTimer ()
+{
+    if (!m_client || m_client->state () != QAbstractSocket::ConnectedState)
+        return;
+    if (m_state != State::Idle)
+        return;
+    if (m_pskspotsReply)
+        return;
+    QString const callUp = m_myCallsign.trimmed ().toUpper ();
+    if (callUp.isEmpty ())
+        return;
+
+    constexpr int kCliPskAutoSpotLimit = 10;
+    appendCliLog (QStringLiteral ("OUT"), QStringLiteral ("\\n"));
+    m_client->write ("\r\n");
+    beginPskReporterSpotsQuery (callUp, kCliPskAutoSpotLimit, true);
+}
+
 // ---------------------------------------------------------------------------
 // Inbound spectrum + decode data from MainWindow
 // ---------------------------------------------------------------------------
@@ -604,9 +1107,8 @@ void TcpCliServer::handleSet(QStringList const& parts)
 void TcpCliServer::onTxStart(QString message)
 {
     if (m_state == State::Unauthed || !m_client) return;
-    m_lastTxMessage = message;
     QString const ts = QDateTime::currentDateTimeUtc().toString("hh:mm:ss");
-    sendLineAfterNewline(QString("[%1] !!! TX: %2").arg(ts).arg(message));
+    sendLineAfterNewline(QString("[%1] TX: %2").arg(ts).arg(message));
     sendPrompt();
 }
 
@@ -614,12 +1116,43 @@ void TcpCliServer::onTxStop()
 {
     if (m_state == State::Unauthed || !m_client) return;
     QString const ts = QDateTime::currentDateTimeUtc().toString("hh:mm:ss");
-    if (m_lastTxMessage.isEmpty())
-        sendLineAfterNewline(QString("[%1] !!! TX STOP").arg(ts));
-    else
-        sendLineAfterNewline(QString("[%1] !!! TX STOP (%2)").arg(ts).arg(m_lastTxMessage));
-    m_lastTxMessage.clear();
+    sendLineAfterNewline(QString("[%1] TX STOP").arg(ts));
     sendPrompt();
+}
+
+void TcpCliServer::notifyQsoLogged(QDateTime const& timeUtc, QString const& dx_call,
+                                   QString const& dx_grid,
+                                   Radio::Frequency dial_freq_hz,
+                                   QString const& mode)
+{
+    if (m_state != State::Idle || !m_client) return;
+
+    QString const ts = timeUtc.isValid()
+                           ? timeUtc.toUTC().toString(QStringLiteral("hh:mm:ss"))
+                           : QDateTime::currentDateTimeUtc().toString(
+                                 QStringLiteral("hh:mm:ss"));
+    QString const call = dx_call.trimmed();
+    QString const gridDisp = dx_grid.trimmed().isEmpty()
+                                 ? QStringLiteral("(no grid)")
+                                 : dx_grid.trimmed();
+
+    QString mhzDisp;
+    if (dial_freq_hz == 0u)
+        mhzDisp = QLatin1Char('?');
+    else
+        mhzDisp = trimTrailingZerosMHz(
+            Radio::frequency_MHz_string(dial_freq_hz, 6, QLocale::c()));
+
+    sendLineAfterNewline(
+        QStringLiteral("[%1] LOG: %2 %3 @ %4 MHz %5")
+            .arg(ts, call, gridDisp, mhzDisp, mode));
+    sendPrompt();
+}
+
+void TcpCliServer::setSpotsReceiverCountryFormatter (
+    std::function<QString (QString const&)> formatter)
+{
+    m_spotsRcvrCountryFmt = std::move (formatter);
 }
 
 void TcpCliServer::onTxFirstChanged(bool txFirst)
@@ -627,10 +1160,62 @@ void TcpCliServer::onTxFirstChanged(bool txFirst)
     m_txFirst = txFirst;
 }
 
-void TcpCliServer::setStationSnapshot(QString const& callsign, QString const& grid)
+void TcpCliServer::setStationSnapshot (QString const& callsign, QString const& grid,
+                                       Radio::Frequency dialFreqHz)
 {
-    m_myCallsign = callsign.trimmed();
-    m_myGrid     = grid.trimmed();
+    m_myCallsign  = callsign.trimmed ();
+    m_myGrid      = grid.trimmed ();
+    m_dialFreqHz = dialFreqHz;
+    // PSK auto-spots timer only meaningful when a CLI TCP client is attached.
+    if (m_client)
+        updatePskSpotsAutoTimer ();
+}
+
+void TcpCliServer::injectOperatorMessage (QString const& text)
+{
+    QString const t = normalizeCliChatText (text);
+    if (t.isEmpty ())
+        return;
+    QString const line = QStringLiteral ("[OPERATOR] ") + t;
+    appendCliLog (QStringLiteral ("OUT"), line);
+    if (m_client && m_state == State::Idle)
+    {
+        m_client->write ("\r\n");
+        m_client->write ((line + QStringLiteral ("\r\n")).toUtf8 ());
+        m_client->flush ();
+        sendPrompt ();
+    }
+}
+
+bool TcpCliServer::injectOperatorLineAsCliCommand (QString const& text)
+{
+    QString const line = normalizeCliChatText (text);
+    if (line.isEmpty ())
+        return false;
+    if (!m_client || m_state != State::Idle)
+        return false;
+
+    appendCliLog (QStringLiteral ("IN"), line);
+    m_client->write ("\r\n");
+    m_client->write ((line + QStringLiteral ("\r\n")).toUtf8 ());
+    m_client->flush ();
+    processLine (line);
+    return true;
+}
+
+bool TcpCliServer::kickClient ()
+{
+    if (!m_client || m_client->state () != QAbstractSocket::ConnectedState)
+        return false;
+    QString const peer = QStringLiteral ("%1:%2")
+                             .arg (m_client->peerAddress ().toString ())
+                             .arg (m_client->peerPort ());
+    appendCliLog (QStringLiteral ("SYS"),
+                  QStringLiteral ("operator kicked client %1").arg (peer));
+    sendLine (QStringLiteral ("BYE disconnected by operator"));
+    m_client->flush ();
+    m_client->disconnectFromHost ();
+    return true;
 }
 
 void TcpCliServer::onSpectrum(QVector<float> savg, float df3, int nfa, int nfb)
@@ -642,7 +1227,8 @@ void TcpCliServer::onSpectrum(QVector<float> savg, float df3, int nfa, int nfb)
     m_spectrumPending  = true;
 }
 
-void TcpCliServer::onDecodes(QStringList decodes, QStringList countries)
+void TcpCliServer::onDecodes (QStringList decodes, QStringList countries,
+                              QString queuedAutoTxPlain)
 {
     if (!m_client || m_state == State::Unauthed) return;
 
@@ -653,9 +1239,42 @@ void TcpCliServer::onDecodes(QStringList decodes, QStringList countries)
     if (m_lastDecodeCountries.size() > m_lastDecodes.size())
         m_lastDecodeCountries = m_lastDecodeCountries.mid(0, m_lastDecodes.size());
 
-    // Refresh m_selectedDecode against the new batch (freq selection persists;
-    // decode at that freq may appear or disappear each period).
-    if (m_selectedFreq >= 0)
+    // Refresh m_selectedDecode each burst: DX partner may have moved frequency.
+    if (!m_selectedDxBaseUpper.isEmpty ())
+    {
+        m_selectedDecode.clear ();
+        m_selectedCountry.clear ();
+        QString foundRaw;
+        QString foundCountry;
+        int foundHz = -1;
+        for (int i = 0; i < m_lastDecodes.size (); ++i)
+        {
+            QString const& raw = m_lastDecodes[i];
+            if (cliDxBaseCallUpperFromRaw (raw) == m_selectedDxBaseUpper)
+            {
+                foundRaw       = raw;
+                foundHz        = extractFreqFromDecode (raw);
+                foundCountry = (i < m_lastDecodeCountries.size ())
+                    ? m_lastDecodeCountries[i]
+                    : QString ();
+                break;
+            }
+        }
+        if (!foundRaw.isEmpty ())
+        {
+            m_selectedDecode      = foundRaw;
+            m_selectedCountry     = foundCountry;
+            if (foundHz >= 0 && foundHz != m_selectedFreq
+                && (!(m_pendingNfa > 0 || m_pendingNfb > 0)
+                    || (foundHz >= m_pendingNfa && foundHz <= m_pendingNfb)))
+            {
+                m_selectedFreq = foundHz;
+                emit setTxAudioFreqSignal (foundHz);
+                emit setRxAudioFreqSignal (foundHz);
+            }
+        }
+    }
+    else if (m_selectedFreq >= 0)
     {
         m_selectedDecode.clear();
         m_selectedCountry.clear();
@@ -694,8 +1313,13 @@ void TcpCliServer::onDecodes(QStringList decodes, QStringList countries)
     for (int i = 0; i < decodes.size(); ++i)
     {
         QString const& c = (i < m_lastDecodeCountries.size()) ? m_lastDecodeCountries[i] : QString();
-        sendLine(decodeIndent + formatDecodeForDisplay(decodes[i], c));
+        sendLine(decodeIndent + formatDecodeForDisplay (
+                     decodes[i], c, m_myCallsign, m_selectedDxBaseUpper));
     }
+
+    QString const qtx = queuedAutoTxPlain.trimmed ();
+    if (!qtx.isEmpty ())
+        sendLine (decodeIndent + QStringLiteral ("TX QUEUED: ") + qtx);
 
     sendPrompt();
 }
@@ -859,6 +1483,8 @@ void TcpCliServer::tryFirstLinePassword(QString const& line)
         m_state = State::Idle;
         sendWelcomeBanner();
         sendPrompt();
+        QTimer::singleShot (0, this, [this]
+                            { updatePskSpotsAutoTimer (); });
     }
     else
     {
@@ -878,11 +1504,13 @@ void TcpCliServer::printHelp()
     sendLine(cliHelpLine(QStringLiteral("set grid <GRID>"), QStringLiteral("g"), QStringLiteral("g <GRID>  -  set my grid")));
     sendLine(cliHelpLine(QStringLiteral("set odd <on|off>"), QStringLiteral("o"), QStringLiteral("o <on|off>  -  odd time slot (TX first)")));
     sendLine(cliHelpLine(QStringLiteral("stoptx"), QStringLiteral("x"), QStringLiteral("Stop TX and AutoSeq; cq/answer start a new sequence")));
-    sendLine(cliHelpLine(QStringLiteral("status"), QStringLiteral("s"), QStringLiteral("Station, slot, offset, selection, decodes (pass)")));
+    sendLine(cliHelpLine(QStringLiteral("status"), QStringLiteral("s"), QStringLiteral("Station, dial MHz, slot, offset, selection, decodes (pass)")));
+    sendLine(cliHelpLine(QStringLiteral("comment <text>"), QStringLiteral("n"), QStringLiteral("n <text>  -  note to operator (log + CLI Log window)")));
     sendLine(cliHelpLine(QStringLiteral("select <Hz>"), QStringLiteral("f"), QStringLiteral("f <Hz>  -  Tx+Rx audio offset")));
     sendLine(cliHelpLine(QStringLiteral("cq [<Hz>]"), QStringLiteral("c"), QStringLiteral("CQ; c <Hz> selects that freq, then CQ")));
     sendLine(cliHelpLine(QStringLiteral("answer [<Hz>]"), QStringLiteral("a"), QStringLiteral("Answer; a <Hz> selects, then answer")));
     sendLine(cliHelpLine(QStringLiteral("help"), QStringLiteral("h"), QStringLiteral("This help text")));
+    sendLine(cliHelpLine(QStringLiteral("spots [<n>]"), QStringLiteral("-"), QStringLiteral("PSK Reporter Tx (pskreporter.info); default 20; auto ≤10 / 5 min (reset by manual spots)")));
     sendLine(cliHelpLine(QStringLiteral("bye"), QStringLiteral("b"), QStringLiteral("Close connection; quit and exit are aliases")));
 }
 
@@ -899,14 +1527,22 @@ void TcpCliServer::printStatus()
         ? QStringLiteral("Odd  (Tx first / odd FT8 cycle)")
         : QStringLiteral("Even (Tx second / even FT8 cycle)");
     QString const decode = m_selectedDecode.isEmpty()
-        ? QStringLiteral("(none at this audio offset)")
-        : formatDecodeForDisplay(m_selectedDecode, m_selectedCountry);
+        ? QStringLiteral("(no decode matching selection)")
+        : formatDecodeForDisplay (m_selectedDecode, m_selectedCountry, m_myCallsign,
+                                   m_selectedDxBaseUpper);
 
     sendLine(rule);
     sendLine(QStringLiteral(" status"));
     sendLine(rule);
     sendLine(QStringLiteral("  Callsign        %1").arg(callShow));
     sendLine(QStringLiteral("  Grid            %1").arg(gridShow));
+    {
+        QString const dialShow = (m_dialFreqHz == 0u)
+            ? QStringLiteral ("(not set)")
+            : trimTrailingZerosMHz (
+                Radio::frequency_MHz_string (m_dialFreqHz, 6, QLocale::c ()));
+        sendLine (QStringLiteral ("  Dial frequency  %1 MHz").arg (dialShow));
+    }
     sendLine(QStringLiteral("  TX time slot    %1").arg(slotShow));
     sendLine(QStringLiteral("  Audio offset    %1 Hz  (Tx + Rx)").arg(m_selectedFreq));
     sendLine(QStringLiteral("  Selection       %1").arg(decode));
@@ -926,7 +1562,9 @@ void TcpCliServer::printSelectedSlot()
         sendLine(QString("selected %1 Hz (no decode — valid for cq)").arg(m_selectedFreq));
         return;
     }
-    sendLine(QString("selected: %1").arg(formatDecodeForDisplay(m_selectedDecode, m_selectedCountry)));
+    sendLine (QStringLiteral ("selected: %1").arg (
+        formatDecodeForDisplay (m_selectedDecode, m_selectedCountry, m_myCallsign,
+                                m_selectedDxBaseUpper)));
     QStringList p = m_selectedDecode.trimmed().split(' ', Qt::SkipEmptyParts);
     if (p.size() >= 5)
     {

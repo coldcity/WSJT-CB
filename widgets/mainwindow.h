@@ -78,6 +78,7 @@ class QSharedMemory;
 class QSplashScreen;
 class QSettings;
 class QLineEdit;
+class QCheckBox;
 class QFont;
 class QHostInfo;
 class EchoGraph;
@@ -131,7 +132,8 @@ public:
   // Signals emitted at the end of each decode cycle (when decoder finishes).
   // Connected to TcpCliServer by connectCli().
   Q_SIGNAL void spectrumReady (QVector<float> savg, float df3, int nfa, int nfb);
-  Q_SIGNAL void decodesReady  (QStringList decodes, QStringList countries);
+  Q_SIGNAL void decodesReady (QStringList decodes, QStringList countries,
+                               QString queuedAutoTxPlain);
   Q_SIGNAL void txStarted (QString message);
   Q_SIGNAL void txStopped ();
 
@@ -165,8 +167,13 @@ private:
   void showQSYMessage(QString message);
   void updateCliLogDialogStyle ();
   void loadCliLogFromFile ();
+  void syncCliServerSnapshot ();
   void accumulateCliDecode (QString const& message);
   QString cliCountryForMessage (QString const& message) const;
+  /** DXCC territory short label for PSK Reporter RX callsign (\c TcpCliServer \c spots). */
+  QString cliCountryForSpottedReceiver (QString const& receiverCallsign) const;
+  /** Next Auto-Tx message text (selected Tx field), or empty if none queued for CLI burst. */
+  QString cliPendingAutoTxPlainText () const;
 
 private slots:
   void initialize_fonts ();
@@ -850,6 +857,11 @@ private:
   class TcpCliServer* m_cliServer {nullptr};
   class QDialog*     m_cliLogDialog {nullptr};
   class QPlainTextEdit* m_cliLogEdit {nullptr};
+  class QLineEdit* m_cliOperatorInput {nullptr};
+  class QCheckBox* m_cliLogShowTimestampsCheck {nullptr};
+  class QCheckBox* m_cliLogSendAsCliCommandCheck {nullptr};
+  bool m_cliLogTimestampsShown {true};
+  bool m_cliLogInjectAsCliCommand {false};
   QString m_fnameWE;            // save path without extension
   QString m_rpt;
   QString m_nextRpt;

@@ -1,14 +1,24 @@
 #ifndef TCP_CLI_SERVER_HPP
 #define TCP_CLI_SERVER_HPP
 
+#include <QDateTime>
 #include <QObject>
 #include <QFile>
 #include <QHostAddress>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QStringList>
+#include <QPointer>
+#include <QTimer>
 #include <QTime>
 #include <QVector>
+
+#include <functional>
+
+#include "Radio.hpp"
+
+class QNetworkAccessManager;
+class QNetworkReply;
 
 //
 // TcpCliServer — single-client TCP CLI for WSJT-CB.
@@ -44,11 +54,29 @@ public:
     // -----------------------------------------------------------------------
     Q_SLOT void onSpectrum(QVector<float> savg, float df3, int nfa, int nfb);
     // countries[i] is display name for decodes[i] (DXCC entity from DE call); may be shorter than decodes.
-    Q_SLOT void onDecodes(QStringList decodes, QStringList countries);
+    Q_SLOT void onDecodes(QStringList decodes, QStringList countries,
+                          QString queuedAutoTxPlain);
     Q_SLOT void onTxStart(QString message);
     Q_SLOT void onTxStop();
     Q_SLOT void onTxFirstChanged(bool txFirst);
-    Q_SLOT void setStationSnapshot(QString const& callsign, QString const& grid);
+    Q_SLOT void setStationSnapshot(QString const& callsign, QString const& grid, Radio::Frequency dialFreqHz);
+
+    /** Log as OUT, prepend "[OPERATOR] "; push to authenticated CLI client and flush prompt when idle. */
+    Q_SLOT void injectOperatorMessage(QString const& text);
+
+    /** Logs as IN, echoes line + CRLF on TCP as if typed, then dispatches commands. False if empty after normalization or client not Idle/connected. */
+    bool injectOperatorLineAsCliCommand(QString const& text);
+
+    /** Forcibly close the connected CLI client (operator action from GUI). Logs SYS, sends **BYE** with an operator-kick tag, then disconnects. Returns false if no client in **Connected** state. */
+    bool kickClient();
+
+    /** After a successful logbook write (\c LogBook::add), notify Idle CLI clients (\c LOG: …), same framing as TX start/stop. */
+    void notifyQsoLogged(QDateTime const& timeUtc, QString const& dx_call,
+                         QString const& dx_grid, Radio::Frequency dial_freq_hz,
+                         QString const& mode);
+
+    /** PSK Reporter \c spots rows include a shortened DXCC territory for \a receiverCallsign (from CTY lookup). Unset ⇒ em dash column. */
+    void setSpotsReceiverCountryFormatter (std::function<QString (QString const& receiverCallsign)> formatter);
 
     // -----------------------------------------------------------------------
     // Outbound: TX actions
@@ -90,6 +118,7 @@ private Q_SLOTS:
     void onNewConnection();
     void onClientDisconnected();
     void onReadyRead();
+    void onPskSpotsAutoTimer();
 
 private:
     enum class State { Unauthed, Idle };
@@ -97,9 +126,10 @@ private:
     void processLine(QString const& line);
     void handleSet(QStringList const& parts);
 
-    // Select audio Hz, update TX/RX, refresh m_selectedDecode from m_lastDecodes.
+    // Select audio Hz, update TX/RX, snapshot decode + DX base at that Hz (CQ slot → no DX lock).
     // Sends ERR/OK lines; returns false if selection failed.
-    bool trySelectAudioFreq(int freqHz);
+    // When \a sendOkOnSuccess is false, selection state is updated but no **`OK: selected …`** line is sent (used by **`answer <Hz>`** so only **`OK: answering …`** appears).
+    bool trySelectAudioFreq(int freqHz, bool sendOkOnSuccess = true);
 
     void sendLine(QString const& text);
     // CR+LF so async lines appear below the `> ` prompt (terminal has no echo newline)
@@ -118,6 +148,11 @@ private:
     void appendSingleCliLogLine(QString const& role, QString const& text);
     void appendCliLog(QString const& role, QString const& text);
 
+    void beginPskReporterSpotsQuery (QString const& senderCallUpper, int limit,
+                                     bool fromAutoTimer = false);
+    void updatePskSpotsAutoTimer ();
+    void restartPskSpotsAutoTimerCooldown ();
+
     QTcpServer    m_server;
     QTcpSocket*   m_client {nullptr};
     State         m_state  {State::Unauthed};
@@ -129,11 +164,14 @@ private:
     QStringList   m_lastDecodes;        // last full decode batch
     QStringList   m_lastDecodeCountries; // parallel: DXCC-style country name for CLI (same order as m_lastDecodes)
 
-    // Selection is keyed by audio frequency (Hz), not by decode-list index.
-    // m_selectedDecode empty → freq set but no decode there (valid for cq)
+    // Selection: audio frequency (Hz) + optional DX partner (base call, upper) for decode rows.
+    // m_selectedDxBaseUpper set from the decode at select time; each burst re-resolves m_selectedDecode
+    // by that callsign (partner may have moved frequency) and may retune Tx/Rx to match.
+    // m_selectedDecode empty → no row for partner this pass, or freq-only CQ slot with no decode.
     int           m_selectedFreq   {1200};
-    QString       m_selectedDecode;     // raw decode string at m_selectedFreq, or ""
+    QString       m_selectedDecode;     // raw decode string for locked partner / freq row, or ""
     QString       m_selectedCountry;    // country column for m_selectedDecode (CLI display)
+    QString       m_selectedDxBaseUpper; // Radio::base_callsign(DX), upper; empty if CQ-only / no partner
 
     // Last spectrum snapshot (stored so we can send with decode burst)
     QVector<float> m_pendingSpectrum;
@@ -146,11 +184,16 @@ private:
 
     QString        m_myCallsign;      // mirrored from MainWindow / config (for status)
     QString        m_myGrid;
-
-    QString        m_lastTxMessage;   // last message passed to onTxStart (for TX STOP line)
+    Radio::Frequency m_dialFreqHz {0u};
 
     QString        m_cliLogPath;     // same path as m_cliLog.fileName() after open
     QFile          m_cliLog;         // append-only transcript: exe dir / wsjtcb-cli.log
+
+    QNetworkAccessManager*    m_pskretrieveNam {nullptr};
+    QPointer<QNetworkReply>   m_pskspotsReply {};
+    QTimer                    m_pskspotsAutoTimer;
+
+    std::function<QString (QString const&)> m_spotsRcvrCountryFmt;
 };
 
 #endif // TCP_CLI_SERVER_HPP

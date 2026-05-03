@@ -14,6 +14,8 @@
 #include <QStandardPaths>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
+#include <QCoreApplication>
 #include <QTextStream>
 #include <QDebug>
 #include <QDebugStateSaver>
@@ -31,6 +33,31 @@ namespace
 {
   auto const file_name = "cty.dat";
   auto const grid_file_name = "grid.dat";    // NJ0A
+
+  // Install puts cty.dat under share/wsjtcb (cmake --install). Dev/ninja-only runs often have
+  // wsjtcb.exe in build/ with no install tree — fall back to exe dir and ../ (repo root).
+  QString resolve_dat_file (Configuration const * configuration, QString const& name)
+  {
+    QDir const writable {QStandardPaths::writableLocation (QStandardPaths::DataLocation)};
+    QString const pUser = writable.absoluteFilePath (name);
+    if (QFileInfo::exists (pUser))
+      return pUser;
+
+    QString const pInstall = configuration->data_dir ().absoluteFilePath (name);
+    if (QFileInfo::exists (pInstall))
+      return pInstall;
+
+    QDir const appDir {QCoreApplication::applicationDirPath ()};
+    QString const pPortable = appDir.absoluteFilePath (name);
+    if (QFileInfo::exists (pPortable))
+      return pPortable;
+
+    QString const pParent = appDir.absoluteFilePath (QStringLiteral ("../") + name);
+    if (QFileInfo::exists (pParent))
+      return QDir::cleanPath (pParent);
+
+    return pInstall;
+  }
 //  auto const logFileName = "wsjtx_log.adi";  // NJ0A
 
   std::map<QString, QString> const& cb_NNN_to_country ()
@@ -535,11 +562,7 @@ char const * AD1CCty::continent (Continent c)
 
 QString AD1CCty::impl::get_cty_path(Configuration const * configuration)
 {
-  QDir dataPath {QStandardPaths::writableLocation (QStandardPaths::DataLocation)};
-  auto path = dataPath.exists (file_name)
-              ? dataPath.absoluteFilePath (file_name) // user override
-              : configuration->data_dir ().absoluteFilePath (file_name); // or original
-  return path;
+  return resolve_dat_file (configuration, QLatin1String (file_name));
 }
 
 void AD1CCty::impl::load_cty(QFile &file)
@@ -625,17 +648,9 @@ AD1CCty::AD1CCty (Configuration const * configuration)
       }
   }
 
-  QDir dataPath {QStandardPaths::writableLocation (QStandardPaths::DataLocation)};
-  m_->path_ = dataPath.exists (file_name)
-    ? dataPath.absoluteFilePath (file_name) // user override
-    : configuration->data_dir ().absoluteFilePath (file_name); // or original
+  m_->path_ = resolve_dat_file (configuration, QLatin1String (file_name));
 
-  QString path = dataPath.exists (grid_file_name)
-   ? dataPath.absoluteFilePath (grid_file_name) // user override
-   : configuration->data_dir ().absoluteFilePath (grid_file_name);   // or original in the resources FS
-
-
-  QFile file1 {path};
+  QFile file1 {resolve_dat_file (configuration, QLatin1String (grid_file_name))};
 
   if (file1.open (QFile::ReadOnly))
     {
@@ -699,6 +714,13 @@ void AD1CCty::reload(Configuration const * configuration)
     m_->cty_version_ = AD1CCty::lookup("VERSION").entity_name;
     Q_EMIT cty_loaded(m_->cty_version_);
     LOG_INFO(QString{"Loaded CTY.DAT version %1, %2"}.arg (m_->cty_version_date_).arg (m_->cty_version_));
+  }
+  else
+  {
+    LOG_WARN (QString {
+      "CTY.DAT could not be read at \"%1\". DXCC country lookup is disabled "
+      "(install step copies to share/%2, copy cty.dat next to wsjtcb.exe, or download in Settings)."}.arg (
+      m_->path_, QLatin1String ("wsjtcb")));
   }
 }
 

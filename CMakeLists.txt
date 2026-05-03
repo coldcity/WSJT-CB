@@ -1628,6 +1628,33 @@ else ()
 endif ()
 target_link_libraries (wsjtx Qt5::SerialPort wsjt_cxx wsjt_qt wsjt_qtmm ${FFTW3_LIBRARIES} ${LIBM_LIBRARIES})
 
+# Qt QNetworkAccessManager (HTTPS: CLI spots, downloads) loads OpenSSL at runtime from the exe folder.
+# CMake's FindOpenSSL IMPORTED_LOCATION is often wrong for MinGW (*.dll.a / wrong root); derive DLL paths
+# from the MinGW toolchain bin directory resolved from whichever g++/c++ is on PATH during configure/build.
+if (WIN32 AND NOT MSVC)
+  if (DEFINED CMAKE_CXX_COMPILER)
+    get_filename_component (_wsjt_mingw_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    file (GLOB _wsjt_ossl_ssl LIST_DIRECTORIES false "${_wsjt_mingw_bin}/libssl-*.dll")
+    file (GLOB _wsjt_ossl_crypto LIST_DIRECTORIES false "${_wsjt_mingw_bin}/libcrypto-*.dll")
+    set (_wsjt_openssl_deploy)
+    foreach (_wsjt_dll IN LISTS _wsjt_ossl_ssl _wsjt_ossl_crypto)
+      if (EXISTS "${_wsjt_dll}")
+        list (APPEND _wsjt_openssl_deploy "${_wsjt_dll}")
+        add_custom_command (
+          TARGET wsjtx POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_wsjt_dll}"
+                  $<TARGET_FILE_DIR:wsjtx>)
+      endif ()
+    endforeach ()
+    if (_wsjt_openssl_deploy)
+      install (
+        FILES ${_wsjt_openssl_deploy}
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+        COMPONENT runtime)
+    endif ()
+  endif ()
+endif ()
+
 #
 # installation
 #
