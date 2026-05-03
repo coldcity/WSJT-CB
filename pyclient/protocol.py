@@ -20,6 +20,7 @@ class DecodeLine:
     snr: int | None
     dt: float | None
     message: str  # trimmed from fixed 20-char column
+    country: str | None  # DXCC-style label from CLI country column (trimmed); None if absent
     raw_line: str
 
     @property
@@ -38,7 +39,7 @@ class Burst:
     spectrum_line: str = ""
     marker_line: str = ""
     marker_hz: int | None = None
-    tx_slot: MarkerSlot | None = None  # app's TX time slot indicator
+    tx_slot: MarkerSlot | None = None  # operator TX slot (set odd / Tx first); not decode-cycle parity
     decodes: list[DecodeLine] = field(default_factory=list)
     tx_queued_text: str | None = None
     raw_lines: list[str] = field(default_factory=list)
@@ -80,6 +81,13 @@ def parse_decode_line(line: str) -> DecodeLine | None:
     except ValueError:
         dt_val = None
     msg = m.group(5).rstrip()
+    cty_raw = m.group(6)
+    country: str | None
+    if cty_raw is None:
+        country = None
+    else:
+        ct = cty_raw.strip()
+        country = ct if ct else None
 
     return DecodeLine(
         glyphs=glyphs_fixed.strip(),
@@ -87,6 +95,7 @@ def parse_decode_line(line: str) -> DecodeLine | None:
         snr=snr_val,
         dt=dt_val,
         message=msg,
+        country=country,
         raw_line=s,
     )
 
@@ -298,6 +307,31 @@ def primary_dx_token_from_non_cq_decode(msg: str) -> str | None:
         c = cq_caller_station(msg)
         return chase_identity(c).upper() if c else None
     return chase_identity(parts[0]).upper()
+
+
+def decode_row_matches_dx_focus(
+    dl: DecodeLine,
+    dx_upper: str | None,
+    *,
+    my_call_upper: str,
+) -> bool:
+    """
+    True when the row's transmitting DX matches *dx_upper* (locked CQ chase call
+    or early-hunt partner). Used for console highlighting before ``IN_QSO_*``.
+    """
+    if not dx_upper:
+        return False
+    tid = chase_identity(dx_upper).upper()
+    msg_u = dl.message.upper()
+    if dl.cq:
+        if is_own_cq_message(dl.message, my_call_upper):
+            return False
+        c = cq_caller_station(dl.message)
+        return bool(c and chase_identity(c).upper() == tid)
+    tok = primary_dx_token_from_non_cq_decode(dl.message)
+    if tok and chase_identity(tok).upper() == tid:
+        return True
+    return message_mentions_callsign_plain_or_hashed(msg_u, tid)
 
 
 def burst_decode_freqs(decodes: list[DecodeLine]) -> list[int]:

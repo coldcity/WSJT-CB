@@ -28,11 +28,25 @@ idle_answer_passes_call = 6
 # While waiting for first non-CQ "@* to us" after a successful `answer`: how many passes we tolerate the DX still showing *! CQ on the waterfall with TX queued before `stoptx` and picking another station.
 max_answer_cq_ignore_passes = 4
 
-# After we lock a CQ station (SNR-weighted pick + `answer`), how many consecutive non-OK or failed `answer` commands before we drop that target and roll the same dice as "target quit CQ" (enter_calling_cq vs stay answering).
+# After we lock a CQ station (weighted SNR pick + optional country bonuses + `answer`), how many consecutive non-OK or failed `answer` commands before we drop that target and roll the same dice as "target quit CQ" (enter_calling_cq vs stay answering).
 max_chase_answer_retries = 8
+
+# --- CQ answer weighting (softmax on SNR + bonuses in dB; higher = stronger pull vs raw signal) ---
+# Temperature for exp((score - max) / τ); lower τ = sharper peak on the strongest-looking CQ.
+cq_snr_temperature_db = 10.0
+# Phrases matched against the CLI decode **country** column (substring match, case-insensitive). See doc/CLI_API.md.
+cq_preferred_countries = ["U.S.A.", "United States", "USA", "Hawaii"]
+cq_preferred_country_bonus_db = 0.0
+# Bias toward decodes whose country is **not** in your ADIF `COUNTRY` fields (requires worked_adif).
+cq_new_country_bonus_db = 0.0
+# One ADIF path or TOML array; can be your WSJT-X / WSJT-CB accumulated log export.
+# worked_adif = ["C:/Users/me/AppData/Local/WSJT-X/wsjtx_log.adi"]
 
 # Stdout mirrors most server traffic and prefixes outbound lines with "> "; enable to keep the console quieter (still connects and runs the driver logic).
 quiet_wire_transcript = false
+
+# Color-code the driver's stdout transcript (ANSI). Honours NO_COLOR; disabled for non-TTY outputs (piped logs).
+ansi_colors = true
 
 # Python log level: when true use DEBUG noise; false keeps INFO summaries.
 verbose = false
